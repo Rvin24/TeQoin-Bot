@@ -33,7 +33,8 @@ import { Contract, ZeroAddress, formatEther, parseEther, type ContractTransactio
 import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
 import { loadWallets, shortAddress } from "./wallet.js";
-import { askAmount, confirm, pickWallets } from "./prompt.js";
+import { askAmount, askCount, confirm, pickWallets } from "./prompt.js";
+import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
@@ -44,10 +45,20 @@ export interface BridgeFlags {
   wallet?: string;
   /** Per-tx amount in ETH (decimal string, e.g. "0.001"). */
   amount?: string;
+  /** Bridges per wallet. Default 1. */
+  count?: string;
   /** Override recipient on the destination chain (defaults to sender). */
   to?: string;
   /** Skip the confirmation prompt. */
   yes?: boolean;
+  /**
+   * If both are set, ignore `amount` and pick a fresh random amount in
+   * `[randomMin, randomMax]` (inclusive) for every individual bridge tx.
+   * Used by the auto-24h orchestrator and exposed via
+   * --random-min / --random-max.
+   */
+  randomMin?: string;
+  randomMax?: string;
 }
 
 export type BridgeDirection = "deposit" | "withdraw";
@@ -101,10 +112,19 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
 
     const selected = await pickWallets(wallets, flags.wallet);
 
-    const amount = flags.amount?.trim()
-      ? validateAmount(flags.amount.trim())
-      : await askAmount(env.TRANSFER_AMOUNT);
-    const value = parseEther(amount);
+    const count = flags.count
+      ? parsePositiveInt(flags.count, "count")
+      : flags.yes
+        ? 1
+        : await askCount("How many bridge transactions per wallet?", 1);
+
+    const randomRange = resolveRandomRange(flags);
+    const fixedAmount = randomRange
+      ? undefined
+      : flags.amount?.trim()
+        ? validateAmount(flags.amount.trim())
+        : await askAmount(env.TRANSFER_AMOUNT);
+    const fixedValue = fixedAmount ? parseEther(fixedAmount) : undefined;
 
     const flagTo = (flags.to ?? "").trim();
     let explicitRecipient: string;
@@ -121,17 +141,25 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     // Pre-flight balance check.
     const balances = await Promise.all(selected.map((w) => provider.getBalance(w.address)));
 
+    const amountLabel = randomRange
+      ? `random ${randomRange.min}–${randomRange.max} ${route.source.symbol} per tx`
+      : `${fixedAmount} ${route.source.symbol}`;
+    const totalBridges = count * selected.length;
+    const perTxBudget = randomRange ? parseEther(randomRange.max) : (fixedValue ?? 0n);
+    const required = perTxBudget * BigInt(count);
     console.log(`\nBridge summary:`);
     console.log(`  Direction    : ${route.direction.toUpperCase()} (${route.source.name} → ${route.destination.name})`);
     console.log(`  Wallets      : ${selected.length}`);
-    console.log(`  Amount / tx  : ${amount} ${route.source.symbol}`);
+    console.log(`  Tx / wallet  : ${count}`);
+    console.log(`  Amount / tx  : ${amountLabel}`);
+    console.log(`  Total tx     : ${totalBridges}`);
     console.log(`  Recipient    : ${explicitRecipient ? explicitRecipient : "<same as sender on destination>"}`);
     selected.forEach((w, i) => {
       const bal = balances[i] ?? 0n;
-      const ok = bal >= value;
+      const ok = bal >= required;
       console.log(
         `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${route.source.symbol}` +
-        (ok ? "" : `  ⚠ need ${amount} for this bridge — will skip`),
+        (ok ? "" : `  ⚠ need up to ${formatEther(required)} for batch — will skip`),
       );
     });
     if (route.direction === "withdraw") {
@@ -140,7 +168,7 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
 
     const proceed = flags.yes
       ? true
-      : await confirm(`\nBroadcast ${selected.length} bridge transaction${selected.length === 1 ? "" : "s"}?`, false);
+      : await confirm(`\nBroadcast ${totalBridges} bridge transaction${totalBridges === 1 ? "" : "s"}?`, false);
     if (!proceed) {
       console.log("Aborted (no transactions broadcast).");
       return;
@@ -153,32 +181,35 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     for (let i = 0; i < selected.length; i++) {
       const wallet = selected[i]!;
       const balance = balances[i] ?? 0n;
-      if (balance < value) {
-        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped (insufficient balance).`);
-        skippedCount++;
+      if (balance < required) {
+        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped (insufficient balance for batch).`);
+        skippedCount += count;
         continue;
       }
       const recipient = explicitRecipient || wallet.address;
       const contract = new Contract(route.contractAddress, route.abi, wallet.signer);
-      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${amount} ${route.source.symbol} → ${shortAddress(recipient)}…`);
-      try {
-        const tx = await invokeBridge(contract, route, recipient, value);
-        console.log(`  hash: ${tx.hash}`);
-        console.log(`  ${txUrl(route.source, tx.hash)}`);
-        const receipt = await tx.wait(1);
-        const status = receipt?.status === 1 ? "confirmed on source" : `mined (status ${receipt?.status ?? "?"})`;
-        console.log(`  ${status} in block ${receipt?.blockNumber ?? "?"}`);
-        if (route.direction === "deposit") {
-          console.log(`  Funds will be credited on ${route.destination.name} after L2 picks up the deposit.`);
-        } else {
-          console.log(`  Withdrawal initiated. Track via api.teqoin.io/api/v1/address/${wallet.address}/bridge-history`);
-          console.log(`  Claimable on ${route.destination.name} after the 24h challenge period.`);
+      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${count} tx → ${shortAddress(recipient)}…`);
+      for (let k = 0; k < count; k++) {
+        const txAmount = randomRange ? pickRandomAmount(randomRange) : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
+        try {
+          const tx = await invokeBridge(contract, route, recipient, txAmount.wei);
+          console.log(`  [${k + 1}/${count}] ${txAmount.eth} ${route.source.symbol}  hash: ${tx.hash}`);
+          console.log(`        ${txUrl(route.source, tx.hash)}`);
+          const receipt = await tx.wait(1);
+          const status = receipt?.status === 1 ? "confirmed" : `mined (status ${receipt?.status ?? "?"})`;
+          console.log(`        ${status} in block ${receipt?.blockNumber ?? "?"}`);
+          sentCount++;
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.log(`  [${k + 1}/${count}] failed: ${message}`);
+          failedCount++;
         }
-        sentCount++;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.log(`  failed: ${message}`);
-        failedCount++;
+      }
+      if (route.direction === "deposit") {
+        console.log(`  Funds will be credited on ${route.destination.name} after L2 picks up the deposits.`);
+      } else {
+        console.log(`  Withdrawals initiated. Track via api.teqoin.io/api/v1/address/${wallet.address}/bridge-history`);
+        console.log(`  Claimable on ${route.destination.name} after the 24h challenge period.`);
       }
     }
     console.log(`\nDone. ${sentCount} sent, ${skippedCount} skipped, ${failedCount} failed.`);
@@ -277,4 +308,22 @@ function validateAmount(raw: string): string {
     throw new Error(`Invalid --amount="${raw}". Must be a positive decimal (e.g. 0.001).`);
   }
   return raw;
+}
+
+function parsePositiveInt(raw: string, label: string): number {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 1000) {
+    throw new Error(`Invalid --${label}="${raw}". Must be a positive integer (1..1000).`);
+  }
+  return n;
+}
+
+function resolveRandomRange(flags: BridgeFlags): RandomEthRange | undefined {
+  const min = flags.randomMin?.trim();
+  const max = flags.randomMax?.trim();
+  if (!min && !max) return undefined;
+  if (!min || !max) {
+    throw new Error("--random-min and --random-max must be provided together.");
+  }
+  return validateRange({ min, max });
 }
