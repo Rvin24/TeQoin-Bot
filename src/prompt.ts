@@ -191,25 +191,50 @@ export async function askCount(label: string, defaultValue = 1): Promise<number>
   }
 }
 
+export type MainAction = "balance" | "transfer" | "bridge" | "auto" | "help";
+
 /**
  * Top-level main-menu picker.
  *
- * Returns one of "balance" | "transfer" | "bridge" | "help".
- * Non-TTY callers should pass the command via argv instead.
+ * Non-TTY callers should pass the command via argv instead — when there
+ * is no TTY this falls back to "help".
  */
-export async function pickMainAction(): Promise<"balance" | "transfer" | "bridge" | "help"> {
+export async function pickMainAction(): Promise<MainAction> {
   if (!isTTY()) return "help";
   console.log("\nWhat do you want to do?");
   console.log("   1. Check Balance       (TeQoin L2 + Sepolia, all wallets)");
   console.log("   2. Transfer            (TeQoin L2, auto recipient from explorer)");
   console.log("   3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)");
-  console.log("   4. Help");
+  console.log("   4. Auto 24h            (loop transfers + bridges, sleep 24h, repeat)");
+  console.log("   5. Help");
   for (;;) {
     const ans = (await ask("Choice [1]: ")).trim().toLowerCase();
     if (ans === "" || ans === "1" || ans === "balance") return "balance";
     if (ans === "2" || ans === "transfer") return "transfer";
     if (ans === "3" || ans === "bridge") return "bridge";
-    if (ans === "4" || ans === "help" || ans === "?") return "help";
-    console.log("  → invalid choice. Type 1, 2, 3, or 4.");
+    if (ans === "4" || ans === "auto") return "auto";
+    if (ans === "5" || ans === "help" || ans === "?") return "help";
+    console.log("  → invalid choice. Type 1, 2, 3, 4, or 5.");
+  }
+}
+
+/**
+ * Prompt for a bridge "mode" used by the auto-24h orchestrator. Returns
+ * one of "deposit" (deposits only), "withdraw" (withdrawals only), or
+ * "both" (does N deposits AND N withdrawals per wallet per cycle).
+ * Non-TTY callers should pass via flag.
+ */
+export async function askBridgeMode(): Promise<"deposit" | "withdraw" | "both"> {
+  if (!isTTY()) return "both";
+  console.log("\nBridge direction for the cycle:");
+  console.log("   1. Deposit only   (Sepolia → TeQoin L2)");
+  console.log("   2. Withdraw only  (TeQoin L2 → Sepolia)");
+  console.log("   3. Both           (deposits AND withdrawals each cycle)");
+  for (;;) {
+    const ans = (await ask("Direction [3]: ")).trim().toLowerCase();
+    if (ans === "" || ans === "3" || ans === "both") return "both";
+    if (ans === "1" || ans === "deposit") return "deposit";
+    if (ans === "2" || ans === "withdraw") return "withdraw";
+    console.log("  → invalid choice. Type 1, 2, or 3.");
   }
 }

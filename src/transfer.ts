@@ -25,6 +25,7 @@ import { type LoadedWallet, shortAddress, loadWallets } from "./wallet.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
 import { pickWallets, askAmount, askCount, confirm } from "./prompt.js";
 import { fetchAddressPool, sampleRecipients } from "./explorer.js";
+import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 
 export interface TransferFlags {
   /** 1-based wallet index, or "all". Defaults to interactive picker. */
@@ -37,6 +38,13 @@ export interface TransferFlags {
   count?: string;
   /** Skip the confirmation prompt. */
   yes?: boolean;
+  /**
+   * If both are set, ignore `amount` and pick a fresh random amount in
+   * `[randomMin, randomMax]` (inclusive) for every individual tx. Used
+   * by the auto-24h orchestrator and exposed via --random-min / --random-max.
+   */
+  randomMin?: string;
+  randomMax?: string;
 }
 
 interface TransferResult {
@@ -68,10 +76,18 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     const count = flags.count
       ? parsePositiveInt(flags.count, "count")
       : await askCount("How many transactions per wallet?", 1);
-    const amount = flags.amount?.trim()
-      ? validateAmount(flags.amount.trim())
-      : await askAmount(env.TRANSFER_AMOUNT);
-    const value = parseEther(amount);
+
+    // Resolve amount source. Three possibilities, in priority order:
+    //   (a) random range via --random-min/--random-max  → re-roll per tx
+    //   (b) fixed --amount                              → same value every tx
+    //   (c) interactive prompt                          → same value every tx
+    const randomRange = resolveRandomRange(flags);
+    const fixedAmount = randomRange
+      ? undefined
+      : flags.amount?.trim()
+        ? validateAmount(flags.amount.trim())
+        : await askAmount(env.TRANSFER_AMOUNT);
+    const fixedValue = fixedAmount ? parseEther(fixedAmount) : undefined;
 
     // Build recipient list.
     const totalRecipientsNeeded = count * selected.length;
@@ -94,23 +110,29 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     }
 
     // Summary.
+    const amountLabel = randomRange
+      ? `random ${randomRange.min}–${randomRange.max} ${chain.symbol} per tx`
+      : `${fixedAmount} ${chain.symbol}`;
     console.log(`\nTransfer summary:`);
     console.log(`  Chain        : ${chain.name} (chainId ${chain.chainId})`);
     console.log(`  Wallets      : ${selected.length}`);
     console.log(`  Tx / wallet  : ${count}`);
-    console.log(`  Amount / tx  : ${amount} ${chain.symbol}`);
+    console.log(`  Amount / tx  : ${amountLabel}`);
     console.log(`  Total tx     : ${totalRecipientsNeeded}`);
     console.log(`  Recipients   : ${fixedRecipient ? "fixed (--to)" : "auto from explorer"}`);
 
-    // Per-wallet pre-flight balance check (covers count × amount; gas headroom is small on TeQoin L2).
-    const required = value * BigInt(count);
+    // Per-wallet pre-flight balance check. For the random-range case we
+    // budget the *worst case* (count × max) so a wallet that just barely
+    // covers the upper bound isn't surprised mid-batch.
+    const perTxBudget = randomRange ? parseEther(randomRange.max) : (fixedValue ?? 0n);
+    const required = perTxBudget * BigInt(count);
     const balances = await Promise.all(selected.map((w) => provider.getBalance(w.address)));
     selected.forEach((w, i) => {
       const bal = balances[i] ?? 0n;
       const ok = bal >= required;
       console.log(
         `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${chain.symbol}` +
-        (ok ? "" : `  ⚠ need ${formatEther(required)} for batch — will skip`),
+        (ok ? "" : `  ⚠ need up to ${formatEther(required)} for batch — will skip`),
       );
     });
 
@@ -145,6 +167,10 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
         const initial = recipients[recipientIdx++]!;
         const tried = new Set<string>([initial]);
         let recipient = initial;
+        // Pick the per-tx amount once for this slot. Retries below reuse
+        // the same value so a successful retry sends what the user
+        // would expect; a fresh roll happens only on the next slot.
+        const txAmount = randomRange ? pickRandomAmount(randomRange) : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
         // Up to 3 attempts: if estimateGas reverts (e.g. recipient is an
         // unflagged contract that doesn't accept native ETH), pick another
         // address from the pool and retry. Bail out on the 4th failure or
@@ -155,10 +181,11 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
         let sent = false;
         for (let attempt = 0; attempt < 4 && !sent; attempt++) {
           try {
-            const req: TransactionRequest = { to: recipient, value };
+            const req: TransactionRequest = { to: recipient, value: txAmount.wei };
             await wallet.signer.estimateGas(req);
             const tx = await wallet.signer.sendTransaction(req);
-            console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}  hash: ${tx.hash}`);
+            const amountSuffix = randomRange ? `  (${txAmount.eth} ${chain.symbol})` : "";
+            console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}${amountSuffix}  hash: ${tx.hash}`);
             console.log(`        ${txUrl(chain, tx.hash)}`);
             const receipt = await tx.wait(1);
             const status = receipt?.status === 1 ? "confirmed" : "mined (status != 1)";
@@ -226,4 +253,19 @@ function pickRetryRecipient(pool: readonly string[], tried: ReadonlySet<string>)
   if (remaining.length === 0) return undefined;
   const idx = Math.floor(Math.random() * remaining.length);
   return remaining[idx];
+}
+
+/**
+ * Both --random-min and --random-max must be provided together. Either
+ * is alone is treated as a user error. Returns `undefined` when neither
+ * is set, otherwise a validated range.
+ */
+function resolveRandomRange(flags: TransferFlags): RandomEthRange | undefined {
+  const min = flags.randomMin?.trim();
+  const max = flags.randomMax?.trim();
+  if (!min && !max) return undefined;
+  if (!min || !max) {
+    throw new Error("--random-min and --random-max must be provided together.");
+  }
+  return validateRange({ min, max });
 }

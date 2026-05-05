@@ -26,7 +26,8 @@ What do you want to do?
    1. Check Balance       (TeQoin L2 + Sepolia, all wallets)
    2. Transfer            (TeQoin L2, auto recipient from explorer)
    3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)
-   4. Help
+   4. Auto 24h            (loop transfers + bridges, sleep 24h, repeat)
+   5. Help
 ```
 
 ### 1. Check Balance
@@ -68,7 +69,28 @@ The flow:
 6. Per-tx broadcast with explorer link on the source chain.
 7. After a withdrawal you can track status via `https://api.teqoin.io/api/v1/address/<addr>/bridge-history`.
 
-### 4. Help
+### 4. Auto 24h
+
+Unattended testnet farming loop. Asked once at startup for:
+
+- Wallet(s) to use
+- Number of **transfer** transactions per wallet per cycle
+- Number of **bridge** transactions per wallet per cycle
+- Bridge mode: `deposit only` / `withdraw only` / `both`
+
+Every cycle the bot then:
+
+1. Sends N transfers per wallet on TeQoin L2 (random recipient from explorer, **random amount** between `0.0001`–`0.0013` ETH per tx).
+2. Sends M bridges per wallet (same random-amount range, direction(s) per the chosen mode).
+3. Logs a per-cycle summary.
+4. Sleeps **24h**, with a status update every hour so you know the loop is alive.
+5. Wakes up and starts cycle N+1 with the **same** parameters — no re-prompting.
+
+Ctrl+C at any point exits cleanly. Wallets that can't cover the per-cycle batch are skipped for that phase only — they'll be re-checked next cycle.
+
+Amount range and cooldown are configurable via env (`AUTO_TRANSFER_AMOUNT_MIN`/`MAX`, `AUTO_BRIDGE_AMOUNT_MIN`/`MAX`, `AUTO_COOLDOWN_HOURS`) — useful for smoke-testing the loop without waiting a full day, or for tweaking the spending profile without changing code.
+
+### 5. Help
 
 Same as `pnpm start help` — full flag/env reference.
 
@@ -114,6 +136,10 @@ pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
 # Bridge: withdraw 0.001 ETH from TeQoin L2 → Sepolia (24h challenge period)
 pnpm start bridge --direction withdraw --wallet 1 --amount 0.001 --yes
 
+# Auto 24h: every 24h, do 10 transfers (random 0.0001–0.0013 ETH each)
+# + 1 deposit + 1 withdraw per wallet, looping forever
+pnpm start auto --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
+
 # Show full help / env reference
 pnpm start help
 ```
@@ -126,11 +152,19 @@ pnpm start help
 | `transfer` | `--amount <eth>` | Per-tx amount in ETH (decimal string).                            |
 | `transfer` | `--to <addr>`    | Override recipient (skip explorer auto-pick).                     |
 | `transfer` | `--yes`          | Skip confirmation prompt.                                         |
+| `transfer` | `--random-min <eth>` / `--random-max <eth>` | Pick a fresh random per-tx amount in this range each tx. Overrides `--amount`. |
 | `bridge`   | `--direction <d>`| `deposit` (Sepolia→TeQoin) or `withdraw` (TeQoin→Sepolia).        |
 | `bridge`   | `--wallet <n\|all>` | 1-based wallet index, or `all` for batch.                      |
+| `bridge`   | `--count <N>`    | Bridge transactions per wallet (default 1).                       |
 | `bridge`   | `--amount <eth>` | Per-tx amount in ETH.                                             |
+| `bridge`   | `--random-min <eth>` / `--random-max <eth>` | Pick a fresh random per-tx amount in this range each tx. Overrides `--amount`. |
 | `bridge`   | `--to <addr>`    | Recipient on the destination chain (defaults to the sender).      |
 | `bridge`   | `--yes`          | Skip confirmation prompt.                                         |
+| `auto`     | `--wallet <n\|all>` | 1-based wallet index, or `all` for batch.                      |
+| `auto`     | `--transfers <N>`| Transfer transactions per wallet per cycle.                       |
+| `auto`     | `--bridges <N>`  | Bridge transactions per wallet per cycle (per direction when mode=both). |
+| `auto`     | `--bridge-mode <m>` | `deposit`, `withdraw`, or `both`.                              |
+| `auto`     | `--yes`          | Skip confirmation prompt before starting the infinite loop.       |
 
 Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and never blocks on prompts.
 
@@ -145,6 +179,9 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `SEPOLIA_RPC_URL`  | no       | Override default Sepolia RPC (`https://ethereum-sepolia-rpc.publicnode.com`). |
 | `TEQOIN_API_URL`   | no       | Override default TeQoin indexer API (`https://api.teqoin.io`).        |
 | `TRANSFER_AMOUNT`  | no       | Default amount in ETH if `--amount` is omitted.                       |
+| `AUTO_TRANSFER_AMOUNT_MIN` / `_MAX` | no | Random amount range used by `auto` for transfers (defaults `0.0001` / `0.0013`). |
+| `AUTO_BRIDGE_AMOUNT_MIN`   / `_MAX` | no | Random amount range used by `auto` for bridges (defaults `0.0001` / `0.0013`). |
+| `AUTO_COOLDOWN_HOURS`              | no | Sleep duration between auto cycles (default `24`). Fractional values OK for testing. |
 
 \*Or use `wallets.txt`.
 
@@ -172,6 +209,8 @@ src/
   balance.ts    # balance command (both chains in one shot)
   transfer.ts   # transfer command (TeQoin-only, looped, auto-recipients)
   bridge.ts     # bridge command (deposit + withdraw via the TeQoin bridge contracts)
+  auto.ts       # auto-24h orchestrator (loop transfers + bridges, sleep, repeat)
+  random.ts     # random-amount picker shared by transfer / bridge / auto
   index.ts      # CLI entry point + main-menu dispatcher
 ```
 
@@ -187,6 +226,7 @@ src/
 - [x] Looped transfers with `count`
 - [x] Auto-recipient sourcing from the TeQoin indexer
 - [x] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw, native ETH)
+- [x] **Auto 24h** loop with randomized per-tx amounts
 - [ ] Bridge status polling (read `bridge-history` and watch for L1 finalization / claim window)
 - [ ] ERC-20 transfer + ERC-20 bridge (the bridge contract supports it; this only ships native ETH today)
 - [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)

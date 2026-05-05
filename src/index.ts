@@ -1,17 +1,19 @@
 /**
  * tequoin-bot — CLI entry point.
  *
- * The default UX is now: run `pnpm start` and pick from a top-level menu:
+ * The default UX is: run `pnpm start` and pick from a top-level menu:
  *   1. Check Balance  — balances on TeQoin L2 + Sepolia for every wallet.
  *   2. Transfer       — TeQoin L2 native send, multi-wallet, looped, with
  *                       recipients auto-fetched from the block explorer.
- *   3. Bridge         — placeholder; real impl lands in a follow-up PR.
- *   4. Help           — full flag/env reference.
+ *   3. Bridge         — native ETH bridge between Sepolia and TeQoin L2.
+ *   4. Auto 24h       — loop transfers + bridges, sleep 24h, repeat.
+ *   5. Help           — full flag/env reference.
  *
  * Power users can still call commands directly with flags:
  *   pnpm start balance
  *   pnpm start transfer --wallet all --count 5 --amount 0.0001 --yes
- *   pnpm start bridge
+ *   pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
+ *   pnpm start auto    --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
  */
 
 import "dotenv/config";
@@ -19,6 +21,7 @@ import { parseArgs, flagString, flagBool } from "./cli.js";
 import { runTransfer } from "./transfer.js";
 import { runBalance } from "./balance.js";
 import { runBridge } from "./bridge.js";
+import { runAuto } from "./auto.js";
 import { pickMainAction } from "./prompt.js";
 
 const HELP = `
@@ -31,29 +34,50 @@ Commands (callable directly):
   balance     Native balance of every loaded wallet on TeQoin L2 + Sepolia.
   transfer    Native send on TeQoin L2 (recipient auto-fetched from explorer).
   bridge      Move native ETH between Sepolia and TeQoin L2 (deposit / withdraw).
+  auto        Loop transfers + bridges, sleep 24h between cycles.
   help        Show this help.
 
 Transfer flags:
   --wallet <n|all>      1-based wallet index or "all"      (else interactive)
   --count <N>           transactions per wallet            (else interactive, default 1)
   --amount <eth>        amount per tx in ETH               (else interactive)
+  --random-min <eth>    randomize amount per tx, lower bound (use with --random-max)
+  --random-max <eth>    randomize amount per tx, upper bound (use with --random-min)
   --to <addr>           send everything to a fixed addr    (else auto from explorer)
   --yes                 skip the confirmation prompt
 
 Bridge flags:
   --direction <d>       "deposit" (Sepolia→TeQoin) or "withdraw" (TeQoin→Sepolia)
   --wallet <n|all>      1-based wallet index or "all"
+  --count <N>           bridge transactions per wallet     (default 1)
   --amount <eth>        amount per tx in ETH
+  --random-min <eth>    randomize amount per tx, lower bound (use with --random-max)
+  --random-max <eth>    randomize amount per tx, upper bound (use with --random-min)
   --to <addr>           recipient on the destination chain (else: same as sender)
   --yes                 skip the confirmation prompt
+
+Auto-24h flags:
+  --wallet <n|all>      1-based wallet index or "all"
+  --transfers <N>       transfers per wallet per cycle
+  --bridges <N>         bridges per wallet per cycle (per direction when mode=both)
+  --bridge-mode <m>     "deposit", "withdraw", or "both" (default: both)
+  --yes                 skip the confirmation prompt before starting the loop
+
+Auto-24h env overrides:
+  AUTO_TRANSFER_AMOUNT_MIN  default 0.0001
+  AUTO_TRANSFER_AMOUNT_MAX  default 0.0013
+  AUTO_BRIDGE_AMOUNT_MIN    default 0.0001
+  AUTO_BRIDGE_AMOUNT_MAX    default 0.0013
+  AUTO_COOLDOWN_HOURS       default 24
 
 Examples:
   pnpm start
   pnpm start balance
   pnpm start transfer --wallet all --count 3 --amount 0.0001 --yes
-  pnpm start transfer --to 0xRECIPIENT --amount 0.001
-  pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
-  pnpm start bridge --direction withdraw --wallet 1 --amount 0.001 --yes
+  pnpm start transfer --wallet 1 --count 5 --random-min 0.0001 --random-max 0.0013 --yes
+  pnpm start bridge --direction deposit  --wallet 1 --count 2 --amount 0.01  --yes
+  pnpm start bridge --direction withdraw --wallet 1 --count 1 --amount 0.001 --yes
+  pnpm start auto    --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
 
 Env vars (see .env.example for the full list):
   PRIVATE_KEYS=0xKEY1,0xKEY2,...   required (or use wallets.txt)
@@ -78,6 +102,8 @@ async function main(): Promise<void> {
         to: flagString(flags, "to"),
         amount: flagString(flags, "amount"),
         count: flagString(flags, "count"),
+        randomMin: flagString(flags, "random-min"),
+        randomMax: flagString(flags, "random-max"),
         yes: flagBool(flags, "yes") || flagBool(flags, "y"),
       });
       return;
@@ -89,7 +115,19 @@ async function main(): Promise<void> {
         direction: flagString(flags, "direction"),
         wallet: flagString(flags, "wallet"),
         amount: flagString(flags, "amount"),
+        count: flagString(flags, "count"),
         to: flagString(flags, "to"),
+        randomMin: flagString(flags, "random-min"),
+        randomMax: flagString(flags, "random-max"),
+        yes: flagBool(flags, "yes") || flagBool(flags, "y"),
+      });
+      return;
+    case "auto":
+      await runAuto({
+        wallet: flagString(flags, "wallet"),
+        transfers: flagString(flags, "transfers"),
+        bridges: flagString(flags, "bridges"),
+        bridgeMode: flagString(flags, "bridge-mode"),
         yes: flagBool(flags, "yes") || flagBool(flags, "y"),
       });
       return;
