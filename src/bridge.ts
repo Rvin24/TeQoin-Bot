@@ -32,7 +32,7 @@
 import { Contract, ZeroAddress, formatEther, parseEther, type ContractTransactionResponse } from "ethers";
 import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
-import { loadWallets, shortAddress } from "./wallet.js";
+import { loadWallets, shortAddress, summarizeWalletSources } from "./wallet.js";
 import { askAmount, askCount, confirm, pickWallets } from "./prompt.js";
 import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 import * as readline from "node:readline/promises";
@@ -108,7 +108,7 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     console.log(`Contract     : ${route.contractAddress}`);
 
     const wallets = loadWallets(provider, { env });
-    console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} from ${wallets[0]?.source ?? "?"}.\n`);
+    console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} (${summarizeWalletSources(wallets)}).\n`);
 
     const selected = await pickWallets(wallets, flags.wallet);
 

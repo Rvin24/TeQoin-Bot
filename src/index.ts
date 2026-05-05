@@ -2,18 +2,20 @@
  * tequoin-bot — CLI entry point.
  *
  * The default UX is: run `pnpm start` and pick from a top-level menu:
- *   1. Check Balance  — balances on TeQoin L2 + Sepolia for every wallet.
- *   2. Transfer       — TeQoin L2 native send, multi-wallet, looped, with
- *                       recipients auto-fetched from the block explorer.
- *   3. Bridge         — native ETH bridge between Sepolia and TeQoin L2.
- *   4. Auto 24h       — loop transfers + bridges, sleep 24h, repeat.
- *   5. Help           — full flag/env reference.
+ *   1. Check Balance   — balances on TeQoin L2 + Sepolia for every wallet.
+ *   2. Transfer        — TeQoin L2 native send, multi-wallet, looped, with
+ *                        recipients auto-fetched from the block explorer.
+ *   3. Bridge          — native ETH bridge between Sepolia and TeQoin L2.
+ *   4. Auto 24h        — loop transfers + bridges, sleep 24h, repeat.
+ *   5. Create Account  — generate worker wallets (saved to generated-wallets.json).
+ *   6. Help            — full flag/env reference.
  *
  * Power users can still call commands directly with flags:
  *   pnpm start balance
  *   pnpm start transfer --wallet all --count 5 --amount 0.0001 --yes
  *   pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
  *   pnpm start auto    --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
+ *   pnpm start create  --count 5 --yes
  */
 
 import "dotenv/config";
@@ -22,6 +24,7 @@ import { runTransfer } from "./transfer.js";
 import { runBalance } from "./balance.js";
 import { runBridge } from "./bridge.js";
 import { runAuto } from "./auto.js";
+import { runCreate } from "./create.js";
 import { pickMainAction } from "./prompt.js";
 
 const HELP = `
@@ -35,6 +38,7 @@ Commands (callable directly):
   transfer    Native send on TeQoin L2 (recipient auto-fetched from explorer).
   bridge      Move native ETH between Sepolia and TeQoin L2 (deposit / withdraw).
   auto        Loop transfers + bridges, sleep 24h between cycles.
+  create      Generate new worker wallets (saved to generated-wallets.json).
   help        Show this help.
 
 Transfer flags:
@@ -70,6 +74,16 @@ Auto-24h env overrides:
   AUTO_BRIDGE_AMOUNT_MAX    default 0.0013
   AUTO_COOLDOWN_HOURS       default 24
 
+Create Account flags:
+  --count <N>           number of new wallets to generate (else interactive)
+  --yes                 skip the confirmation prompt
+
+Main account top-up:
+  When the main wallet (PRIVATE_KEYS[0]) runs the transfer command (or the
+  transfer phase of auto) and recipients are auto, generated wallets with
+  balance below MAIN_TOPUP_THRESHOLD (default 0.005 ETH) are filled first,
+  before the bot falls back to random explorer addresses.
+
 Examples:
   pnpm start
   pnpm start balance
@@ -78,11 +92,13 @@ Examples:
   pnpm start bridge --direction deposit  --wallet 1 --count 2 --amount 0.01  --yes
   pnpm start bridge --direction withdraw --wallet 1 --count 1 --amount 0.001 --yes
   pnpm start auto    --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
+  pnpm start create  --count 5 --yes
 
 Env vars (see .env.example for the full list):
   PRIVATE_KEYS=0xKEY1,0xKEY2,...   required (or use wallets.txt)
   TEQOIN_RPC_URL / SEPOLIA_RPC_URL override default RPC endpoints
   TEQOIN_API_URL                   override default explorer API base
+  MAIN_TOPUP_THRESHOLD             low-balance threshold for generated wallets (default 0.005 ETH)
 `.trim();
 
 async function main(): Promise<void> {
@@ -128,6 +144,13 @@ async function main(): Promise<void> {
         transfers: flagString(flags, "transfers"),
         bridges: flagString(flags, "bridges"),
         bridgeMode: flagString(flags, "bridge-mode"),
+        yes: flagBool(flags, "yes") || flagBool(flags, "y"),
+      });
+      return;
+    case "create":
+    case "create-account":
+      await runCreate({
+        count: flagString(flags, "count"),
         yes: flagBool(flags, "yes") || flagBool(flags, "y"),
       });
       return;

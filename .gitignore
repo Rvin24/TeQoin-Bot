@@ -7,3 +7,4 @@ dist/
 build/
 .tsbuildinfo
 wallets.txt
+generated-wallets.json
