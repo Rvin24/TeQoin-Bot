@@ -79,10 +79,19 @@ Create Account flags:
   --yes                 skip the confirmation prompt
 
 Main account top-up:
-  When the main wallet (PRIVATE_KEYS[0]) runs the transfer command (or the
-  transfer phase of auto) and recipients are auto, generated wallets with
-  balance below MAIN_TOPUP_THRESHOLD (default 0.005 ETH) are filled first,
-  before the bot falls back to random explorer addresses.
+  When the main wallet (PRIVATE_KEYS[0]) runs the transfer or bridge
+  command (or those phases inside auto) AND recipients are auto (no
+  --to flag), generated wallets are topped up first:
+
+    transfer  - generated wallets with balance below MAIN_TOPUP_THRESHOLD
+                (default 0.005 ETH) on TeQoin L2 are picked as recipients
+                first, then the bot falls back to random explorer addresses.
+    bridge    - generated wallets with balance below MAIN_TOPUP_THRESHOLD
+                on the *destination* chain are picked as recipients first,
+                then the bot falls back to the main wallet's own address
+                on the destination chain.
+
+  Setting --to forces a single recipient and disables this priority.
 
 Examples:
   pnpm start

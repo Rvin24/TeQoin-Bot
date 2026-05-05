@@ -15,6 +15,22 @@
  *     value   : msg.value = amount  (must match the amount arg exactly)
  *     ⚠ subject to a 24h challenge period before claimable on L1
  *
+ * Top-up priority for the main account:
+ *   When the sending wallet has role="main" AND the user didn't pass
+ *   --to (i.e. recipient is auto), the bot tops up generated wallets
+ *   on the *destination* chain first. "Top up" means: any generated
+ *   wallet whose balance on the destination chain is below
+ *   MAIN_TOPUP_THRESHOLD (default 0.005 ETH) becomes a preferred
+ *   recipient, ordered ascending by current balance (poorest first).
+ *   Once the priority queue is drained, remaining slots fall back to
+ *   the main wallet's own address on the destination chain (the
+ *   pre-existing default). This mirrors the transfer command's
+ *   priority logic so the funded wallet's bridge activity also funds
+ *   workers across both chains.
+ *
+ *   Non-main wallets and any run with --to set keep the existing
+ *   single-recipient behavior.
+ *
  * Both contracts and selectors were extracted from real bridge transactions
  * the user (@Rvin24) executed via the TeQoin Wallet Mini App. The selectors
  * were confirmed against openchain.xyz / 4byte.directory:
@@ -32,11 +48,13 @@
 import { Contract, ZeroAddress, formatEther, parseEther, type ContractTransactionResponse } from "ethers";
 import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
-import { loadWallets, shortAddress, summarizeWalletSources } from "./wallet.js";
+import { loadWallets, shortAddress, summarizeWalletSources, type LoadedWallet } from "./wallet.js";
 import { askAmount, askCount, confirm, pickWallets } from "./prompt.js";
 import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+
+const DEFAULT_TOPUP_THRESHOLD_ETH = "0.005";
 
 export interface BridgeFlags {
   /** "deposit" (Sepolia→TeQoin) or "withdraw" (TeQoin→Sepolia). */
@@ -100,6 +118,10 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
   const direction = await resolveDirection(flags.direction);
   const route = BRIDGE_ROUTES[direction];
   const provider = buildProvider(route.source, env);
+  // Built lazily inside the body when we need to query generated-wallet
+  // balances on the destination chain. Declared at the function level so
+  // the `finally` block can `.destroy()` it on every exit path.
+  let destProvider: ReturnType<typeof buildProvider> | undefined;
 
   try {
     const { blockNumber } = await assertChainMatches(provider, route.source);
@@ -132,14 +154,39 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
       explicitRecipient = validateAddress(flagTo);
     } else if (flags.yes) {
       // --yes implies "no interactive prompts": default to sender's own address
-      // on the destination chain. The user can still pass --to to override.
+      // on the destination chain (or, for the main wallet, the top-up queue
+      // built below). The user can still pass --to to force a single recipient.
       explicitRecipient = "";
     } else {
-      explicitRecipient = await askDestRecipient(route.destination, selected);
+      explicitRecipient = await askDestRecipient(route.destination, selected, wallets);
     }
 
-    // Pre-flight balance check.
+    // Pre-flight balance check (source-chain balances of the senders).
     const balances = await Promise.all(selected.map((w) => provider.getBalance(w.address)));
+
+    // Build the top-up queue, if applicable. Same shape as transfer.ts:
+    // generated wallets whose balance on the *destination* chain is below
+    // MAIN_TOPUP_THRESHOLD, sorted ascending. Only relevant when the main
+    // wallet is in `selected` AND no explicit recipient is set.
+    let topupQueue: string[] = [];
+    const mainSelected = selected.find((w) => w.role === "main");
+    const generatedWallets = wallets.filter((w) => w.role === "generated");
+    if (!explicitRecipient && mainSelected && generatedWallets.length > 0) {
+      const topupThresholdEth = (env.MAIN_TOPUP_THRESHOLD ?? DEFAULT_TOPUP_THRESHOLD_ETH).trim();
+      const threshold = parseEther(validateAmount(topupThresholdEth));
+      console.log(`Checking ${generatedWallets.length} generated wallet${generatedWallets.length === 1 ? "" : "s"} on ${route.destination.name} for top-up priority (threshold ${topupThresholdEth} ${route.destination.symbol})…`);
+      destProvider = buildProvider(route.destination, env);
+      const destBalances = await Promise.all(
+        generatedWallets.map((w) => destProvider!.getBalance(w.address)),
+      );
+      const mainAddrLower = mainSelected.address.toLowerCase();
+      const lowGenerated = generatedWallets
+        .map((w, i): [LoadedWallet, bigint] => [w, destBalances[i] ?? 0n])
+        .filter(([w, bal]) => bal < threshold && w.address.toLowerCase() !== mainAddrLower)
+        .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+      topupQueue = lowGenerated.map(([w]) => w.address.toLowerCase());
+      console.log(`Top-up priority: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold on ${route.destination.name}.\n`);
+    }
 
     const amountLabel = randomRange
       ? `random ${randomRange.min}–${randomRange.max} ${route.source.symbol} per tx`
@@ -153,7 +200,12 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     console.log(`  Tx / wallet  : ${count}`);
     console.log(`  Amount / tx  : ${amountLabel}`);
     console.log(`  Total tx     : ${totalBridges}`);
-    console.log(`  Recipient    : ${explicitRecipient ? explicitRecipient : "<same as sender on destination>"}`);
+    const recipientLabel = explicitRecipient
+      ? explicitRecipient
+      : topupQueue.length > 0 && mainSelected
+        ? `auto (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} on ${route.destination.name} first; falls back to sender's own address)`
+        : "<same as sender on destination>";
+    console.log(`  Recipient    : ${recipientLabel}`);
     selected.forEach((w, i) => {
       const bal = balances[i] ?? 0n;
       const ok = bal >= required;
@@ -177,6 +229,10 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     let sentCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
+    // Top-up cursor consumed in order across the whole batch so multiple
+    // tx slots from the main wallet drain the queue without giving the
+    // same generated wallet two slots in a row.
+    const topupCursor = { i: 0 };
 
     for (let i = 0; i < selected.length; i++) {
       const wallet = selected[i]!;
@@ -186,14 +242,21 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
         skippedCount += count;
         continue;
       }
-      const recipient = explicitRecipient || wallet.address;
+      const recipientsForWallet = buildBridgeRecipientsForWallet({
+        wallet,
+        count,
+        explicitRecipient: explicitRecipient || undefined,
+        topupQueue,
+        topupCursor,
+      });
       const contract = new Contract(route.contractAddress, route.abi, wallet.signer);
-      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${count} tx → ${shortAddress(recipient)}…`);
+      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${count} tx…`);
       for (let k = 0; k < count; k++) {
+        const recipient = recipientsForWallet[k]!;
         const txAmount = randomRange ? pickRandomAmount(randomRange) : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
         try {
           const tx = await invokeBridge(contract, route, recipient, txAmount.wei);
-          console.log(`  [${k + 1}/${count}] ${txAmount.eth} ${route.source.symbol}  hash: ${tx.hash}`);
+          console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}  ${txAmount.eth} ${route.source.symbol}  hash: ${tx.hash}`);
           console.log(`        ${txUrl(route.source, tx.hash)}`);
           const receipt = await tx.wait(1);
           const status = receipt?.status === 1 ? "confirmed" : `mined (status ${receipt?.status ?? "?"})`;
@@ -215,7 +278,38 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
     console.log(`\nDone. ${sentCount} sent, ${skippedCount} skipped, ${failedCount} failed.`);
   } finally {
     provider.destroy();
+    if (destProvider) destProvider.destroy();
   }
+}
+
+/**
+ * Per-wallet bridge recipient list. Mirrors the equivalent helper in
+ * transfer.ts: the main wallet drains the top-up queue first, falling
+ * back to its own address; everyone else (including --to overrides)
+ * uses a single recipient for every slot.
+ */
+function buildBridgeRecipientsForWallet(args: {
+  wallet: LoadedWallet;
+  count: number;
+  explicitRecipient: string | undefined;
+  topupQueue: readonly string[];
+  topupCursor: { i: number };
+}): string[] {
+  const { wallet, count, explicitRecipient, topupQueue, topupCursor } = args;
+  if (explicitRecipient) {
+    return Array(count).fill(explicitRecipient);
+  }
+  const out: string[] = [];
+  if (wallet.role === "main") {
+    while (out.length < count && topupCursor.i < topupQueue.length) {
+      const next = topupQueue[topupCursor.i++];
+      if (next) out.push(next);
+    }
+  }
+  while (out.length < count) {
+    out.push(wallet.address);
+  }
+  return out;
 }
 
 async function invokeBridge(
@@ -265,18 +359,37 @@ async function resolveDirection(raw?: string): Promise<BridgeDirection> {
 }
 
 /**
- * Ask the user for a destination-chain recipient address. Returning an
- * empty string means "use the sender's own address on the destination
- * chain" — both bridge contracts default that way naturally because we
- * pass `wallet.address` when no override is set.
+ * Ask the user for a destination-chain recipient address.
+ *
+ * - Returning an empty string means "auto" — the main wallet drains the
+ *   top-up queue first, then falls back to the sender's own address;
+ *   non-main wallets always use the sender's own address.
+ * - Returning a 0x-address forces every tx in the batch to that single
+ *   recipient (the pre-existing single-recipient behavior).
+ *
+ * If any generated wallets are loaded and the main wallet is in the
+ * selection, we explain the auto-distribute behavior in the prompt so
+ * the user is not surprised when blank → multiple recipients.
  */
 async function askDestRecipient(
   destChain: ChainProfile,
-  selected: readonly { address: string }[],
+  selected: readonly LoadedWallet[],
+  allWallets: readonly LoadedWallet[],
 ): Promise<string> {
   if (!input.isTTY || !output.isTTY) return "";
   const exampleSender = selected[0]?.address ?? "0xYour-wallet";
-  console.log(`\nRecipient on ${destChain.name} (leave blank to use the same wallet address as the sender, e.g. ${exampleSender}):`);
+  const generatedCount = allWallets.filter((w) => w.role === "generated").length;
+  const mainInSelected = selected.some((w) => w.role === "main");
+  console.log(`\nRecipient on ${destChain.name}:`);
+  if (mainInSelected && generatedCount > 0) {
+    console.log(`  Leave blank to auto-distribute: the main wallet will top up generated`);
+    console.log(`  wallets on ${destChain.name} first (those below MAIN_TOPUP_THRESHOLD,`);
+    console.log(`  default 0.005 ETH), then fall back to the main wallet's own address.`);
+    console.log(`  Or paste a 0x address to force every tx in the batch to one recipient.`);
+  } else {
+    console.log(`  Leave blank to use the same wallet address as the sender (e.g. ${exampleSender}),`);
+    console.log(`  or paste a 0x address to override.`);
+  }
   const rl = readline.createInterface({ input, output });
   try {
     for (;;) {
