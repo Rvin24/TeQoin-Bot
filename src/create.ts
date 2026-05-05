@@ -46,7 +46,19 @@ export async function runCreate(flags: CreateFlags = {}, _env: NodeJS.ProcessEnv
     console.log(`  #${existing.length + i + 1}  ${record.address}  (created ${record.createdAt})`);
   });
   console.log(`\nStore now contains ${existing.length + created.length} generated wallet${existing.length + created.length === 1 ? "" : "s"}.`);
-  console.log(`These wallets are now picked up automatically by every other command:`);
+
+  // Mnemonic / private-key reminder. We deliberately do NOT print the
+  // phrases or private keys to stdout — that's too easy to leak via
+  // terminal history or screen-shares. Tell the user where to find them.
+  const withMnemonic = created.filter((r) => r.mnemonic).length;
+  if (withMnemonic === created.length) {
+    console.log(`Each record includes the BIP-39 mnemonic phrase and derivation path,`);
+    console.log(`so the wallets can be imported into MetaMask / Rabby / hardware wallets`);
+    console.log(`via the 12-word seed phrase as well as via the raw private key.`);
+  }
+  console.log(`To inspect the phrases / keys later, open ${storePath} directly.`);
+
+  console.log(`\nThese wallets are now picked up automatically by every other command:`);
   console.log(`  - They appear in the wallet picker as "#${existing.length + 1}…#${existing.length + created.length}".`);
   console.log(`  - --wallet all will include them.`);
   console.log(`  - When the main account does a transfer batch, low-balance generated wallets`);
@@ -54,7 +66,7 @@ export async function runCreate(flags: CreateFlags = {}, _env: NodeJS.ProcessEnv
   console.log(`\nReminder: ${storePath} is gitignored. Back it up if these wallets matter.`);
 
   // Sanity: print the first short-address only, to discourage copy-pasting
-  // private keys around. The full keys are in the JSON file.
+  // private keys / phrases around. The full secrets are in the JSON file.
   const sample = created[0];
   if (sample) {
     console.log(`\nQuick sanity check: first new wallet shortform = ${shortAddress(sample.address)}`);
