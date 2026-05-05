@@ -27,6 +27,20 @@ export interface GeneratedWalletRecord {
   address: string;
   /** 0x-prefixed lowercase 64-hex-char private key. */
   privateKey: string;
+  /**
+   * 12-word BIP-39 seed phrase (space-separated). Optional for backward
+   * compatibility with stores written before mnemonic support — those
+   * records will only have `privateKey` and won't get a phrase
+   * retroactively (it can't be recovered from a private key).
+   */
+  mnemonic?: string;
+  /**
+   * BIP-44 derivation path used to derive `privateKey` from `mnemonic`.
+   * For wallets minted by this bot it is always the ethers default
+   * `m/44'/60'/0'/0/0`. Stored explicitly so any importer can
+   * reproduce the same address from the phrase.
+   */
+  derivationPath?: string;
   /** ISO-8601 timestamp when this wallet was generated. */
   createdAt: string;
   /** Optional human-friendly tag. Currently always "" but reserved. */
@@ -67,13 +81,26 @@ export function generateAndSaveWallets(
   const created: GeneratedWalletRecord[] = [];
   const now = new Date().toISOString();
   for (let i = 0; i < count; i++) {
+    // Wallet.createRandom() returns an HDNodeWallet whose `mnemonic`
+    // is the BIP-39 seed phrase the wallet was derived from. We persist
+    // both the phrase and the derivation path so the user can re-import
+    // the wallet into MetaMask / Rabby / a hardware wallet using the
+    // 12 words alone, without having to fall back to private-key import.
     const wallet = Wallet.createRandom();
-    created.push({
+    const phrase = wallet.mnemonic?.phrase;
+    // In ethers v6 the BIP-44 derivation path lives on the HDNodeWallet
+    // (`wallet.path`), not on the Mnemonic. For wallets minted via
+    // createRandom() this is `m/44'/60'/0'/0/0` by default.
+    const path = wallet.path ?? undefined;
+    const record: GeneratedWalletRecord = {
       address: wallet.address.toLowerCase(),
       privateKey: wallet.privateKey.toLowerCase(),
       createdAt: now,
       label: "",
-    });
+    };
+    if (phrase) record.mnemonic = phrase;
+    if (path) record.derivationPath = path;
+    created.push(record);
   }
 
   const updated: GeneratedWalletsFile = {
@@ -122,9 +149,14 @@ function isGeneratedWalletsFile(value: unknown): value is GeneratedWalletsFile {
   return obj.wallets.every((w) => {
     if (typeof w !== "object" || w === null) return false;
     const r = w as Record<string, unknown>;
-    return typeof r.address === "string"
-      && typeof r.privateKey === "string"
-      && typeof r.createdAt === "string"
-      && typeof r.label === "string";
+    if (typeof r.address !== "string") return false;
+    if (typeof r.privateKey !== "string") return false;
+    if (typeof r.createdAt !== "string") return false;
+    if (typeof r.label !== "string") return false;
+    // mnemonic and derivationPath are optional for backward compat
+    // with stores written before this feature shipped.
+    if (r.mnemonic !== undefined && typeof r.mnemonic !== "string") return false;
+    if (r.derivationPath !== undefined && typeof r.derivationPath !== "string") return false;
+    return true;
   });
 }

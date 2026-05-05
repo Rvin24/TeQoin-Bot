@@ -126,12 +126,28 @@ Non-main wallets ignore this logic entirely — they always sample from the expl
 {
   "version": 1,
   "wallets": [
-    { "address": "0x…", "privateKey": "0x…", "createdAt": "2026-05-05T…", "label": "" }
+    {
+      "address": "0x…",
+      "privateKey": "0x…",
+      "mnemonic": "word1 word2 … word12",
+      "derivationPath": "m/44'/60'/0'/0/0",
+      "createdAt": "2026-05-05T…",
+      "label": ""
+    }
   ]
 }
 ```
 
-Back it up if these wallets matter. Treat it like `.env`: never commit, never share.
+Each generated wallet stores **both** the raw private key and the BIP-39 12-word seed phrase (with its derivation path). That means you can re-import the wallet into MetaMask / Rabby / a hardware wallet via either path:
+
+- **Private key import** (Settings → Import account → Private key) — paste `privateKey`.
+- **Seed-phrase import** (Settings → Import / restore from seed) — paste `mnemonic`. Use the standard Ethereum derivation path `m/44'/60'/0'/0/0` if the wallet asks (most use it by default).
+
+Both methods produce the exact same address — they're just different formats for the same secret material.
+
+The `mnemonic` and `derivationPath` fields are **optional**; older store files (created before mnemonic support shipped) will only have `privateKey` and continue to work as-is. Mnemonics can't be recovered from a private key, so existing records won't get a phrase retroactively — only newly generated wallets do.
+
+Back it up if these wallets matter. Treat it like `.env`: never commit, never share. The phrases let anyone with a copy spend every wallet, so guard the file the same way you guard `.env`.
 
 ### 6. Help
 
