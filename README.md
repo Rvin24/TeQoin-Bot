@@ -25,7 +25,7 @@ That's it. The menu drives everything.
 What do you want to do?
    1. Check Balance       (TeQoin L2 + Sepolia, all wallets)
    2. Transfer            (TeQoin L2, auto recipient from explorer)
-   3. Bridge              (Sepolia ↔ TeQoin L2 — coming soon)
+   3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)
    4. Help
 ```
 
@@ -41,15 +41,32 @@ Native ETH send on **TeQoin L2** only. The flow:
 2. **How many transactions per wallet?** (default 1)
 3. **Amount per transaction in ETH.**
 4. The bot fetches a recipient pool from `https://api.teqoin.io/api/v1/transaction/latest` (the indexer behind the TeQoin block explorer). Each tx in the batch goes to a different random address from this pool.
+   - Pool is **EOA-only** — `fromAddress` of every recent tx (always an EOA), plus `toAddress` of plain `eoa_transfer` txs. Contract recipients are filtered out so we don't waste gas on contracts that revert when receiving native ETH.
    - Your own wallet addresses and the zero address are excluded.
    - If the pool is smaller than the requested batch, the bot samples with replacement.
+   - If `estimateGas` reverts on a recipient anyway (e.g. an unflagged contract), the bot picks another recipient and retries (up to 3 times per slot).
 5. Pre-flight balance check (skips a wallet if it can't cover `count × amount`).
 6. Confirmation prompt (skip with `--yes`).
 7. Per-tx broadcast with explorer link and status.
 
 ### 3. Bridge
 
-Placeholder — prints what's planned and what data is already accessible via the indexer. Real implementation lands in a follow-up PR after the TeQoin Wallet Mini App's deposit/withdraw contracts have been mapped out.
+Native ETH bridging between Sepolia (L1) and TeQoin L2. Two directions:
+
+| Direction  | Source → Destination | Contract                                     | Function                                                          | Notes                                |
+| ---------- | -------------------- | -------------------------------------------- | ----------------------------------------------------------------- | ------------------------------------ |
+| `deposit`  | Sepolia → TeQoin L2  | `0x2bd57c3ca216f0d38b18bcfd14595f12dfb13c35` | `depositETH(address recipient) payable`                           | Fast — credited after a few L1 blocks |
+| `withdraw` | TeQoin L2 → Sepolia  | `0xbc6ad4965241ea4260eb571c936576a4f537d67b` | `initiateWithdrawal(address token, address recipient, uint256 amount) payable` | **24h challenge period** before claimable on L1 |
+
+The flow:
+
+1. Pick direction (`deposit` or `withdraw`).
+2. Pick wallet(s).
+3. Enter amount in ETH.
+4. Optionally set a different recipient on the destination chain — leave blank to send to the same address as the sender.
+5. Pre-flight balance check + confirmation prompt.
+6. Per-tx broadcast with explorer link on the source chain.
+7. After a withdrawal you can track status via `https://api.teqoin.io/api/v1/address/<addr>/bridge-history`.
 
 ### 4. Help
 
@@ -91,6 +108,12 @@ pnpm start transfer --wallet all --count 5 --amount 0.0001 --yes
 # Transfer 3x to a fixed recipient (override explorer auto-pick)
 pnpm start transfer --wallet 1 --count 3 --amount 0.001 --to 0xRECIPIENT --yes
 
+# Bridge: deposit 0.01 ETH from Sepolia → TeQoin L2 (recipient = sender)
+pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
+
+# Bridge: withdraw 0.001 ETH from TeQoin L2 → Sepolia (24h challenge period)
+pnpm start bridge --direction withdraw --wallet 1 --amount 0.001 --yes
+
 # Show full help / env reference
 pnpm start help
 ```
@@ -103,6 +126,11 @@ pnpm start help
 | `transfer` | `--amount <eth>` | Per-tx amount in ETH (decimal string).                            |
 | `transfer` | `--to <addr>`    | Override recipient (skip explorer auto-pick).                     |
 | `transfer` | `--yes`          | Skip confirmation prompt.                                         |
+| `bridge`   | `--direction <d>`| `deposit` (Sepolia→TeQoin) or `withdraw` (TeQoin→Sepolia).        |
+| `bridge`   | `--wallet <n\|all>` | 1-based wallet index, or `all` for batch.                      |
+| `bridge`   | `--amount <eth>` | Per-tx amount in ETH.                                             |
+| `bridge`   | `--to <addr>`    | Recipient on the destination chain (defaults to the sender).      |
+| `bridge`   | `--yes`          | Skip confirmation prompt.                                         |
 
 Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and never blocks on prompts.
 
@@ -143,7 +171,7 @@ src/
   explorer.ts   # TeQoin indexer client + recipient pool sampling
   balance.ts    # balance command (both chains in one shot)
   transfer.ts   # transfer command (TeQoin-only, looped, auto-recipients)
-  bridge.ts     # bridge command (placeholder; real impl in a follow-up PR)
+  bridge.ts     # bridge command (deposit + withdraw via the TeQoin bridge contracts)
   index.ts      # CLI entry point + main-menu dispatcher
 ```
 
@@ -158,8 +186,9 @@ src/
 - [x] Multi-chain balance in one call
 - [x] Looped transfers with `count`
 - [x] Auto-recipient sourcing from the TeQoin indexer
-- [ ] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw via TeQoin Wallet contracts)
-- [ ] ERC-20 transfer (configurable token list)
+- [x] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw, native ETH)
+- [ ] Bridge status polling (read `bridge-history` and watch for L1 finalization / claim window)
+- [ ] ERC-20 transfer + ERC-20 bridge (the bridge contract supports it; this only ships native ETH today)
 - [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)
 
 ---
@@ -170,4 +199,4 @@ src/
 - Testnet wallets only. The default chains have no production value at risk.
 - All RPC + API traffic is HTTPS.
 - The bot performs a `chainId` sanity check before signing any tx.
-- Recipients fetched from the explorer are real addresses with on-chain activity, so they may be ordinary EOAs OR contracts. Sending native ETH to a contract that doesn't accept it will revert and burn gas (the bot does an `estimateGas` round-trip to surface that before broadcast).
+- Recipients fetched from the explorer are filtered to EOAs only (using the indexer's tx classification), and the broadcast loop falls back to a different recipient if `estimateGas` reverts on a slot. You will never silently send native ETH into a contract sink, but in the rare case all retries fail the slot is reported as failed and the rest of the batch continues.
