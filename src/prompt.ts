@@ -202,7 +202,7 @@ export async function pickMainAction(): Promise<"balance" | "transfer" | "bridge
   console.log("\nWhat do you want to do?");
   console.log("   1. Check Balance       (TeQoin L2 + Sepolia, all wallets)");
   console.log("   2. Transfer            (TeQoin L2, auto recipient from explorer)");
-  console.log("   3. Bridge              (Sepolia ↔ TeQoin L2 — coming soon)");
+  console.log("   3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)");
   console.log("   4. Help");
   for (;;) {
     const ans = (await ask("Choice [1]: ")).trim().toLowerCase();

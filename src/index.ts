@@ -30,22 +30,30 @@ Default flow (recommended):
 Commands (callable directly):
   balance     Native balance of every loaded wallet on TeQoin L2 + Sepolia.
   transfer    Native send on TeQoin L2 (recipient auto-fetched from explorer).
-  bridge      Sepolia ↔ TeQoin L2 — coming soon.
+  bridge      Move native ETH between Sepolia and TeQoin L2 (deposit / withdraw).
   help        Show this help.
 
 Transfer flags:
-  --wallet <n|all>   1-based wallet index or "all"      (else interactive)
-  --count <N>        transactions per wallet            (else interactive, default 1)
-  --amount <eth>     amount per tx in ETH               (else interactive)
-  --to <addr>        send everything to a fixed addr    (else auto from explorer)
-  --yes              skip the confirmation prompt
+  --wallet <n|all>      1-based wallet index or "all"      (else interactive)
+  --count <N>           transactions per wallet            (else interactive, default 1)
+  --amount <eth>        amount per tx in ETH               (else interactive)
+  --to <addr>           send everything to a fixed addr    (else auto from explorer)
+  --yes                 skip the confirmation prompt
+
+Bridge flags:
+  --direction <d>       "deposit" (Sepolia→TeQoin) or "withdraw" (TeQoin→Sepolia)
+  --wallet <n|all>      1-based wallet index or "all"
+  --amount <eth>        amount per tx in ETH
+  --to <addr>           recipient on the destination chain (else: same as sender)
+  --yes                 skip the confirmation prompt
 
 Examples:
   pnpm start
   pnpm start balance
   pnpm start transfer --wallet all --count 3 --amount 0.0001 --yes
   pnpm start transfer --to 0xRECIPIENT --amount 0.001
-  pnpm start bridge
+  pnpm start bridge --direction deposit --wallet 1 --amount 0.01 --yes
+  pnpm start bridge --direction withdraw --wallet 1 --amount 0.001 --yes
 
 Env vars (see .env.example for the full list):
   PRIVATE_KEYS=0xKEY1,0xKEY2,...   required (or use wallets.txt)
@@ -77,7 +85,13 @@ async function main(): Promise<void> {
       await runBalance({ chain: flagString(flags, "chain") });
       return;
     case "bridge":
-      await runBridge();
+      await runBridge({
+        direction: flagString(flags, "direction"),
+        wallet: flagString(flags, "wallet"),
+        amount: flagString(flags, "amount"),
+        to: flagString(flags, "to"),
+        yes: flagBool(flags, "yes") || flagBool(flags, "y"),
+      });
       return;
     case "":
     case "help":
