@@ -1,0 +1,26 @@
+{
+  "name": "tequoin-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-chain transaction bot for TeQoin L2 (chainId 420377) and Ethereum Sepolia testnet. Multi-wallet, native transfer, interactive CLI.",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "transfer": "tsx src/index.ts transfer",
+    "balance": "tsx src/index.ts balance",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
