@@ -65,16 +65,29 @@ export async function fetchLatestTransactions(
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 
 /**
- * Build a pool of unique recipient addresses sourced from recent on-chain
+ * Build a pool of unique EOA recipient addresses sourced from recent on-chain
  * activity. Used by the transfer flow when the user wants the bot to pick
  * recipients automatically instead of typing them by hand.
  *
- * - Includes both `fromAddress` and `toAddress` of every recent tx.
- * - Drops the zero address.
- * - Drops any address present in `excludeAddresses` (typically the user's
- *   own wallets, so we don't waste gas sending to ourselves).
- * - Returns checksummed-lowercase 0x addresses, deduped, in encounter order
- *   (newest tx first).
+ * Why "EOA only": sending native ETH to a contract address that doesn't
+ * accept it (no receive/fallback that handles the value) reverts at
+ * estimateGas time. To avoid wasting tx slots on those, we filter the pool
+ * to addresses we have evidence are externally owned accounts.
+ *
+ * Selection rules (per tx, ordered newest → oldest):
+ *   - `fromAddress` is always an EOA (only EOAs can sign txs), so we always
+ *     include it (subject to the dedupe + exclude filters below).
+ *   - `toAddress` is included ONLY when the tx is `eoa_transfer`
+ *     classification AND `isContractCall === false`. Otherwise we cannot
+ *     prove the recipient is an EOA, so we drop it from the pool.
+ *
+ * Always-applied filters:
+ *   - Drop the zero address.
+ *   - Drop any address present in `excludeAddresses` (typically the user's
+ *     own wallets, so we don't send to ourselves).
+ *   - Dedupe across the pool.
+ *
+ * Returns lowercase 0x addresses in encounter order (newest tx first).
  */
 export async function fetchAddressPool(
   excludeAddresses: Iterable<string>,
@@ -89,16 +102,23 @@ export async function fetchAddressPool(
   const seen = new Set<string>();
   const pool: string[] = [];
 
+  const consider = (candidate: string | undefined): void => {
+    const lower = candidate?.toLowerCase();
+    if (!lower || lower.length !== 42) return;
+    if (lower === ZERO_ADDRESS) return;
+    if (exclude.has(lower)) return;
+    if (seen.has(lower)) return;
+    seen.add(lower);
+    pool.push(lower);
+  };
+
   for (const tx of txs) {
-    for (const candidate of [tx.fromAddress, tx.toAddress]) {
-      const lower = candidate?.toLowerCase();
-      if (!lower || lower.length !== 42) continue;
-      if (lower === ZERO_ADDRESS) continue;
-      if (exclude.has(lower)) continue;
-      if (seen.has(lower)) continue;
-      seen.add(lower);
-      pool.push(lower);
-    }
+    // fromAddress is always an EOA — only EOAs can sign and originate a tx.
+    consider(tx.fromAddress);
+    // toAddress only counts as EOA when this is a plain native-ether transfer.
+    const isPlainTransfer =
+      tx.classification === "eoa_transfer" && tx.isContractCall === false;
+    if (isPlainTransfer) consider(tx.toAddress);
   }
   return pool;
 }
