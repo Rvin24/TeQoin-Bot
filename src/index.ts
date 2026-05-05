@@ -1,70 +1,57 @@
 /**
  * tequoin-bot — CLI entry point.
  *
- * Usage:
- *   pnpm start                       — interactive (auto-detects command via menu)
- *   pnpm start transfer [flags]
- *   pnpm start balance  [flags]
+ * The default UX is now: run `pnpm start` and pick from a top-level menu:
+ *   1. Check Balance  — balances on TeQoin L2 + Sepolia for every wallet.
+ *   2. Transfer       — TeQoin L2 native send, multi-wallet, looped, with
+ *                       recipients auto-fetched from the block explorer.
+ *   3. Bridge         — placeholder; real impl lands in a follow-up PR.
+ *   4. Help           — full flag/env reference.
  *
- * Flags:
- *   --chain <slug>   tequoin | sepolia       (else CHAIN env var, else interactive)
- *   --wallet <n|all> 1-based wallet index    (else interactive; non-TTY → 1)
- *   --to <addr>      recipient address       (transfer)
- *   --amount <eth>   amount as decimal ETH   (transfer)
- *   --yes            skip the confirmation prompt
- *   --help           show this help
+ * Power users can still call commands directly with flags:
+ *   pnpm start balance
+ *   pnpm start transfer --wallet all --count 5 --amount 0.0001 --yes
+ *   pnpm start bridge
  */
 
 import "dotenv/config";
 import { parseArgs, flagString, flagBool } from "./cli.js";
 import { runTransfer } from "./transfer.js";
 import { runBalance } from "./balance.js";
-import { CHAINS } from "./chains.js";
+import { runBridge } from "./bridge.js";
+import { pickMainAction } from "./prompt.js";
 
 const HELP = `
-tequoin-bot — multi-chain transaction bot (TeQoin L2 + Ethereum Sepolia)
+tequoin-bot — multi-chain transaction bot
 
-Usage:
-  pnpm start <command> [flags]
+Default flow (recommended):
+  pnpm start            → menu picks the action
 
-Commands:
-  transfer    Send native ETH from one or more wallets to a recipient.
-  balance     Show native balance of every loaded wallet on the chosen chain.
+Commands (callable directly):
+  balance     Native balance of every loaded wallet on TeQoin L2 + Sepolia.
+  transfer    Native send on TeQoin L2 (recipient auto-fetched from explorer).
+  bridge      Sepolia ↔ TeQoin L2 — coming soon.
   help        Show this help.
 
-Flags:
-  --chain <slug>   ${CHAINS.map((c) => c.slug).join(" | ")}    (else CHAIN env var, else menu)
-  --wallet <n>     1-based wallet index (or "all" for transfer)
-  --to <addr>      recipient address (transfer only)
-  --amount <eth>   amount in ETH as a decimal string (transfer only)
-  --yes            skip the confirmation prompt
-  --help           show this help
+Transfer flags:
+  --wallet <n|all>   1-based wallet index or "all"      (else interactive)
+  --count <N>        transactions per wallet            (else interactive, default 1)
+  --amount <eth>     amount per tx in ETH               (else interactive)
+  --to <addr>        send everything to a fixed addr    (else auto from explorer)
+  --yes              skip the confirmation prompt
 
 Examples:
-  pnpm start transfer
-  pnpm start transfer --chain tequoin --wallet 1 --to 0xabc... --amount 0.001
-  pnpm start transfer --chain sepolia --wallet all --to 0xabc... --amount 0.0005 --yes
-  pnpm start balance --chain tequoin
-`.trim();
+  pnpm start
+  pnpm start balance
+  pnpm start transfer --wallet all --count 3 --amount 0.0001 --yes
+  pnpm start transfer --to 0xRECIPIENT --amount 0.001
+  pnpm start bridge
 
-async function pickCommandInteractively(): Promise<string> {
-  const readline = await import("node:readline/promises");
-  const { stdin: input, stdout: output } = await import("node:process");
-  if (!input.isTTY || !output.isTTY) return "help";
-  const rl = readline.createInterface({ input, output });
-  try {
-    console.log("Pick a command:");
-    console.log("   1. transfer");
-    console.log("   2. balance");
-    console.log("   3. help");
-    const ans = (await rl.question("Command [1]: ")).trim();
-    if (ans === "" || ans === "1" || ans === "transfer") return "transfer";
-    if (ans === "2" || ans === "balance") return "balance";
-    return "help";
-  } finally {
-    rl.close();
-  }
-}
+Env vars (see .env.example for the full list):
+  PRIVATE_KEYS=0xKEY1,0xKEY2,...   required (or use wallets.txt)
+  TEQOIN_RPC_URL / SEPOLIA_RPC_URL override default RPC endpoints
+  TEQOIN_API_URL                   override default explorer API base
+`.trim();
 
 async function main(): Promise<void> {
   const { command: rawCommand, flags } = parseArgs(process.argv.slice(2));
@@ -74,20 +61,23 @@ async function main(): Promise<void> {
     return;
   }
 
-  const command = rawCommand || (await pickCommandInteractively());
+  const command = rawCommand || (await pickMainAction());
 
   switch (command) {
     case "transfer":
       await runTransfer({
-        chain: flagString(flags, "chain"),
         wallet: flagString(flags, "wallet"),
         to: flagString(flags, "to"),
         amount: flagString(flags, "amount"),
+        count: flagString(flags, "count"),
         yes: flagBool(flags, "yes") || flagBool(flags, "y"),
       });
       return;
     case "balance":
       await runBalance({ chain: flagString(flags, "chain") });
+      return;
+    case "bridge":
+      await runBridge();
       return;
     case "":
     case "help":
