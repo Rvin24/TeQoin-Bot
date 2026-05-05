@@ -27,7 +27,8 @@ What do you want to do?
    2. Transfer            (TeQoin L2, auto recipient from explorer)
    3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)
    4. Auto 24h            (loop transfers + bridges, sleep 24h, repeat)
-   5. Help
+   5. Create Account      (generate worker wallets — saved to generated-wallets.json)
+   6. Help
 ```
 
 ### 1. Check Balance
@@ -90,7 +91,49 @@ Ctrl+C at any point exits cleanly. Wallets that can't cover the per-cycle batch 
 
 Amount range and cooldown are configurable via env (`AUTO_TRANSFER_AMOUNT_MIN`/`MAX`, `AUTO_BRIDGE_AMOUNT_MIN`/`MAX`, `AUTO_COOLDOWN_HOURS`) — useful for smoke-testing the loop without waiting a full day, or for tweaking the spending profile without changing code.
 
-### 5. Help
+### 5. Create Account
+
+Generate brand-new EOA wallets and persist them to `generated-wallets.json` in the project root. Once created, those wallets are picked up automatically by every other command — they appear in the wallet picker, count toward `--wallet all`, and become preferred recipients for the main account's transfer batches when their balance is low.
+
+The flow:
+
+1. The bot prints the path to the store file and how many generated wallets already exist.
+2. **How many new wallets do you want to generate?** (default 5)
+3. Confirmation, then generation. Keys are minted with `ethers.Wallet.createRandom()` (platform CSPRNG).
+4. The bot prints each new address and updates the on-disk store.
+
+#### Wallet model: main + workers
+
+This enables a "main + workers" farming setup. The first private key in `PRIVATE_KEYS` (or `wallets.txt`) is the **main** account — the funded one. All generated wallets are **workers**.
+
+When the **main** account runs `transfer` (or the transfer phase of `auto`) with auto-recipient mode, the bot:
+
+1. Queries the on-chain balance of every generated wallet.
+2. Filters those whose balance is below `MAIN_TOPUP_THRESHOLD` (default `0.005 ETH`).
+3. Sorts ascending (poorest first).
+4. Uses them as recipients for the main wallet's tx batch, in that order.
+5. If more recipients are needed than there are low-balance generated wallets, the rest are sampled from the explorer pool as before.
+
+This lets the funded wallet "do something useful" — funding workers — while still producing on-chain activity. Once a worker is topped up above the threshold, it stops being prioritized and starts running its own activity in subsequent cycles.
+
+Non-main wallets ignore this logic entirely — they always sample from the explorer pool.
+
+#### Storage & safety
+
+`generated-wallets.json` is **gitignored** alongside `.env` and `wallets.txt`. The file format:
+
+```json
+{
+  "version": 1,
+  "wallets": [
+    { "address": "0x…", "privateKey": "0x…", "createdAt": "2026-05-05T…", "label": "" }
+  ]
+}
+```
+
+Back it up if these wallets matter. Treat it like `.env`: never commit, never share.
+
+### 6. Help
 
 Same as `pnpm start help` — full flag/env reference.
 
@@ -140,6 +183,9 @@ pnpm start bridge --direction withdraw --wallet 1 --amount 0.001 --yes
 # + 1 deposit + 1 withdraw per wallet, looping forever
 pnpm start auto --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
 
+# Generate 10 new worker wallets (saved to generated-wallets.json)
+pnpm start create --count 10 --yes
+
 # Show full help / env reference
 pnpm start help
 ```
@@ -165,6 +211,8 @@ pnpm start help
 | `auto`     | `--bridges <N>`  | Bridge transactions per wallet per cycle (per direction when mode=both). |
 | `auto`     | `--bridge-mode <m>` | `deposit`, `withdraw`, or `both`.                              |
 | `auto`     | `--yes`          | Skip confirmation prompt before starting the infinite loop.       |
+| `create`   | `--count <N>`    | Number of new wallets to generate.                                |
+| `create`   | `--yes`          | Skip confirmation prompt.                                         |
 
 Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and never blocks on prompts.
 
@@ -182,6 +230,7 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `AUTO_TRANSFER_AMOUNT_MIN` / `_MAX` | no | Random amount range used by `auto` for transfers (defaults `0.0001` / `0.0013`). |
 | `AUTO_BRIDGE_AMOUNT_MIN`   / `_MAX` | no | Random amount range used by `auto` for bridges (defaults `0.0001` / `0.0013`). |
 | `AUTO_COOLDOWN_HOURS`              | no | Sleep duration between auto cycles (default `24`). Fractional values OK for testing. |
+| `MAIN_TOPUP_THRESHOLD`             | no | Threshold (in ETH) below which a generated wallet is prioritized as a recipient when the main account runs `transfer`/`auto`. Default `0.005`. Set to `0` to disable. |
 
 \*Or use `wallets.txt`.
 
@@ -210,6 +259,8 @@ src/
   transfer.ts   # transfer command (TeQoin-only, looped, auto-recipients)
   bridge.ts     # bridge command (deposit + withdraw via the TeQoin bridge contracts)
   auto.ts       # auto-24h orchestrator (loop transfers + bridges, sleep, repeat)
+  create.ts     # create-account command (generate worker wallets)
+  accounts.ts   # generated-wallet store (read/write generated-wallets.json)
   random.ts     # random-amount picker shared by transfer / bridge / auto
   index.ts      # CLI entry point + main-menu dispatcher
 ```
@@ -227,6 +278,7 @@ src/
 - [x] Auto-recipient sourcing from the TeQoin indexer
 - [x] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw, native ETH)
 - [x] **Auto 24h** loop with randomized per-tx amounts
+- [x] **Create worker wallets** + main-account top-up priority
 - [ ] Bridge status polling (read `bridge-history` and watch for L1 finalization / claim window)
 - [ ] ERC-20 transfer + ERC-20 bridge (the bridge contract supports it; this only ships native ETH today)
 - [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)

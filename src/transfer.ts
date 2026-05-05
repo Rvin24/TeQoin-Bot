@@ -6,12 +6,23 @@
  * recent-transactions feed (api.teqoin.io). The user can still override
  * with `--to <addr>` to send everything to a fixed recipient instead.
  *
+ * Top-up priority for the main account:
+ *   When the sending wallet has role="main" (the first env/file key)
+ *   AND we're picking recipients automatically (no --to), the bot first
+ *   tops up any generated wallets whose balance is below
+ *   `MAIN_TOPUP_THRESHOLD` (default 0.005 ETH). Once those slots are
+ *   filled, remaining slots fall back to random explorer addresses.
+ *   This gives the funded wallet a useful job (funding workers) before
+ *   it starts sending to strangers.
+ *
  * Flow:
  *   1. Pick which wallet(s) to use (or all).
  *   2. Ask how many transactions per wallet (default 1).
  *   3. Ask the per-tx amount.
  *   4. Build a recipient pool from the explorer (excluding the user's
- *      own wallets and the zero address).
+ *      own wallets and the zero address). Independently, query the
+ *      balance of every generated wallet so we know which ones the
+ *      main account should top up first.
  *   5. Show summary, ask for confirmation, then broadcast.
  *
  * Per-wallet balance pre-flight: we sum (count × amount + estimated fee
@@ -21,11 +32,13 @@
 
 import { formatEther, parseEther, type TransactionRequest } from "ethers";
 import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
-import { type LoadedWallet, shortAddress, loadWallets } from "./wallet.js";
+import { type LoadedWallet, shortAddress, loadWallets, summarizeWalletSources } from "./wallet.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
 import { pickWallets, askAmount, askCount, confirm } from "./prompt.js";
 import { fetchAddressPool, sampleRecipients } from "./explorer.js";
 import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
+
+const DEFAULT_TOPUP_THRESHOLD_ETH = "0.005";
 
 export interface TransferFlags {
   /** 1-based wallet index, or "all". Defaults to interactive picker. */
@@ -70,7 +83,7 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     console.log(`\nConnected to ${chain.name} (chainId ${chain.chainId}) at block ${blockNumber}.`);
 
     const wallets = loadWallets(provider, { env });
-    console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} from ${wallets[0]?.source ?? "?"}.\n`);
+    console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} (${summarizeWalletSources(wallets)}).\n`);
 
     const selected = await pickWallets(wallets, flags.wallet);
     const count = flags.count
@@ -92,11 +105,11 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     // Build recipient list.
     const totalRecipientsNeeded = count * selected.length;
     const fixedRecipient = (flags.to ?? "").trim();
-    let recipients: string[];
     let recipientPool: string[] = [];
+    let topupQueue: string[] = [];
+    let topupThresholdEth = "";
     if (fixedRecipient) {
       validateAddress(fixedRecipient);
-      recipients = Array(totalRecipientsNeeded).fill(fixedRecipient.toLowerCase());
       console.log(`Recipient (fixed): ${fixedRecipient}`);
     } else {
       console.log(`Fetching recipient pool from ${chain.name} explorer…`);
@@ -106,20 +119,45 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
       if (recipientPool.length === 0) {
         throw new Error("Recipient pool is empty. Pass --to <addr> to use a fixed recipient instead.");
       }
-      recipients = sampleRecipients(recipientPool, totalRecipientsNeeded);
+
+      // Top-up priority queue for the main wallet. Only build it if the
+      // main wallet is actually in `selected` — otherwise no point
+      // querying balances we won't use.
+      const mainSelected = selected.find((w) => w.role === "main");
+      const generatedWallets = wallets.filter((w) => w.role === "generated");
+      if (mainSelected && generatedWallets.length > 0) {
+        topupThresholdEth = (env.MAIN_TOPUP_THRESHOLD ?? DEFAULT_TOPUP_THRESHOLD_ETH).trim();
+        const threshold = parseEther(validateAmount(topupThresholdEth));
+        console.log(`  checking balance of ${generatedWallets.length} generated wallet${generatedWallets.length === 1 ? "" : "s"} for top-up priority (threshold ${topupThresholdEth} ${chain.symbol})…`);
+        const generatedBalances = await Promise.all(
+          generatedWallets.map((w) => provider.getBalance(w.address)),
+        );
+        const mainAddrLower = mainSelected.address.toLowerCase();
+        const lowGenerated = generatedWallets
+          .map((w, i): [LoadedWallet, bigint] => [w, generatedBalances[i] ?? 0n])
+          .filter(([w, bal]) => bal < threshold && w.address.toLowerCase() !== mainAddrLower)
+          .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+        topupQueue = lowGenerated.map(([w]) => w.address.toLowerCase());
+        console.log(`  top-up priority: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold.`);
+      }
     }
 
     // Summary.
     const amountLabel = randomRange
       ? `random ${randomRange.min}–${randomRange.max} ${chain.symbol} per tx`
       : `${fixedAmount} ${chain.symbol}`;
+    const recipientsLabel = fixedRecipient
+      ? "fixed (--to)"
+      : topupQueue.length > 0
+        ? `auto from explorer (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} first)`
+        : "auto from explorer";
     console.log(`\nTransfer summary:`);
     console.log(`  Chain        : ${chain.name} (chainId ${chain.chainId})`);
     console.log(`  Wallets      : ${selected.length}`);
     console.log(`  Tx / wallet  : ${count}`);
     console.log(`  Amount / tx  : ${amountLabel}`);
     console.log(`  Total tx     : ${totalRecipientsNeeded}`);
-    console.log(`  Recipients   : ${fixedRecipient ? "fixed (--to)" : "auto from explorer"}`);
+    console.log(`  Recipients   : ${recipientsLabel}`);
 
     // Per-wallet pre-flight balance check. For the random-range case we
     // budget the *worst case* (count × max) so a wallet that just barely
@@ -146,15 +184,27 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
 
     // Broadcast.
     const results: TransferResult[] = [];
-    let recipientIdx = 0;
+    // Top-up queue is consumed in order across the entire batch — if the
+    // main wallet sends `count` tx and there are M low generated wallets,
+    // the first min(count, M) recipients will be the priority addresses,
+    // sorted ascending by current balance (poorest first).
+    const topupCursor = { i: 0 };
     for (let wi = 0; wi < selected.length; wi++) {
       const wallet = selected[wi]!;
       const balance = balances[wi] ?? 0n;
+      const recipientsForWallet = buildRecipientsForWallet({
+        wallet,
+        count,
+        fixedRecipient: fixedRecipient || undefined,
+        recipientPool,
+        topupQueue,
+        topupCursor,
+      });
       if (balance < required) {
         for (let k = 0; k < count; k++) {
           results.push({
             wallet,
-            recipient: recipients[recipientIdx++] ?? "0x",
+            recipient: recipientsForWallet[k] ?? "0x",
             status: "skipped",
             error: "insufficient balance for batch",
           });
@@ -164,7 +214,7 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
       }
       console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — sending ${count} tx…`);
       for (let k = 0; k < count; k++) {
-        const initial = recipients[recipientIdx++]!;
+        const initial = recipientsForWallet[k]!;
         const tried = new Set<string>([initial]);
         let recipient = initial;
         // Pick the per-tx amount once for this slot. Retries below reuse
@@ -253,6 +303,41 @@ function pickRetryRecipient(pool: readonly string[], tried: ReadonlySet<string>)
   if (remaining.length === 0) return undefined;
   const idx = Math.floor(Math.random() * remaining.length);
   return remaining[idx];
+}
+
+/**
+ * Build the per-wallet recipient list for a single sender. The main
+ * wallet drains the top-up queue first, then falls back to random
+ * explorer addresses; everyone else samples from the explorer pool.
+ *
+ * `topupCursor` is mutated in place so consecutive main-wallet calls
+ * (e.g. main appearing once when `--wallet all` is used) progress
+ * through the queue without giving the same generated wallet two slots.
+ */
+function buildRecipientsForWallet(args: {
+  wallet: LoadedWallet;
+  count: number;
+  fixedRecipient: string | undefined;
+  recipientPool: readonly string[];
+  topupQueue: readonly string[];
+  topupCursor: { i: number };
+}): string[] {
+  const { wallet, count, fixedRecipient, recipientPool, topupQueue, topupCursor } = args;
+  if (fixedRecipient) {
+    return Array(count).fill(fixedRecipient.toLowerCase());
+  }
+  const out: string[] = [];
+  if (wallet.role === "main") {
+    while (out.length < count && topupCursor.i < topupQueue.length) {
+      const next = topupQueue[topupCursor.i++];
+      if (next) out.push(next);
+    }
+  }
+  if (out.length < count) {
+    const fill = sampleRecipients(recipientPool, count - out.length);
+    out.push(...fill);
+  }
+  return out;
 }
 
 /**

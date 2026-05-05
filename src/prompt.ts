@@ -191,7 +191,7 @@ export async function askCount(label: string, defaultValue = 1): Promise<number>
   }
 }
 
-export type MainAction = "balance" | "transfer" | "bridge" | "auto" | "help";
+export type MainAction = "balance" | "transfer" | "bridge" | "auto" | "create" | "help";
 
 /**
  * Top-level main-menu picker.
@@ -206,15 +206,17 @@ export async function pickMainAction(): Promise<MainAction> {
   console.log("   2. Transfer            (TeQoin L2, auto recipient from explorer)");
   console.log("   3. Bridge              (Sepolia ↔ TeQoin L2 — deposit / withdraw)");
   console.log("   4. Auto 24h            (loop transfers + bridges, sleep 24h, repeat)");
-  console.log("   5. Help");
+  console.log("   5. Create Account      (generate worker wallets — saved to generated-wallets.json)");
+  console.log("   6. Help");
   for (;;) {
     const ans = (await ask("Choice [1]: ")).trim().toLowerCase();
     if (ans === "" || ans === "1" || ans === "balance") return "balance";
     if (ans === "2" || ans === "transfer") return "transfer";
     if (ans === "3" || ans === "bridge") return "bridge";
     if (ans === "4" || ans === "auto") return "auto";
-    if (ans === "5" || ans === "help" || ans === "?") return "help";
-    console.log("  → invalid choice. Type 1, 2, 3, 4, or 5.");
+    if (ans === "5" || ans === "create" || ans === "create account") return "create";
+    if (ans === "6" || ans === "help" || ans === "?") return "help";
+    console.log("  → invalid choice. Type 1, 2, 3, 4, 5, or 6.");
   }
 }
 
