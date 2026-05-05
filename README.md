@@ -65,9 +65,9 @@ The flow:
 1. Pick direction (`deposit` or `withdraw`).
 2. Pick wallet(s).
 3. Enter amount in ETH.
-4. Optionally set a different recipient on the destination chain — leave blank to send to the same address as the sender.
+4. Optionally set a destination-chain recipient. Leave blank for **auto**: when the **main** wallet sends and there are generated worker wallets, the bot drains a top-up queue of generated wallets that are below `MAIN_TOPUP_THRESHOLD` on the destination chain (deposits → TeQoin L2 balance, withdraws → Sepolia balance), then falls back to the sender's own destination address. For non-main wallets (or a `--to <addr>` override), every tx in the batch goes to a single recipient — see [Wallet model: main + workers](#wallet-model-main--workers).
 5. Pre-flight balance check + confirmation prompt.
-6. Per-tx broadcast with explorer link on the source chain.
+6. Per-tx broadcast with explorer link on the source chain. The recipient (sender / generated worker / override) is printed for every tx.
 7. After a withdrawal you can track status via `https://api.teqoin.io/api/v1/address/<addr>/bridge-history`.
 
 ### 4. Auto 24h
@@ -106,17 +106,26 @@ The flow:
 
 This enables a "main + workers" farming setup. The first private key in `PRIVATE_KEYS` (or `wallets.txt`) is the **main** account — the funded one. All generated wallets are **workers**.
 
-When the **main** account runs `transfer` (or the transfer phase of `auto`) with auto-recipient mode, the bot:
+When the **main** account runs `transfer` or `bridge` (or those phases inside `auto`) with auto-recipient mode (i.e. no `--to` flag), the bot tops up generated wallets first:
 
-1. Queries the on-chain balance of every generated wallet.
+**Transfer (TeQoin L2)**
+
+1. Queries the on-chain balance of every generated wallet on TeQoin L2.
 2. Filters those whose balance is below `MAIN_TOPUP_THRESHOLD` (default `0.005 ETH`).
 3. Sorts ascending (poorest first).
 4. Uses them as recipients for the main wallet's tx batch, in that order.
 5. If more recipients are needed than there are low-balance generated wallets, the rest are sampled from the explorer pool as before.
 
-This lets the funded wallet "do something useful" — funding workers — while still producing on-chain activity. Once a worker is topped up above the threshold, it stops being prioritized and starts running its own activity in subsequent cycles.
+**Bridge (deposit Sepolia→TeQoin OR withdraw TeQoin→Sepolia)**
 
-Non-main wallets ignore this logic entirely — they always sample from the explorer pool.
+1. Queries the on-chain balance of every generated wallet **on the destination chain** (TeQoin L2 for deposits, Sepolia for withdraws).
+2. Filters those below `MAIN_TOPUP_THRESHOLD` and sorts ascending.
+3. Drains that queue across the bridge tx batch — each tx targets a different generated wallet on the destination chain.
+4. Once the queue is exhausted, remaining slots fall back to the main wallet's own address on the destination chain (the previous default).
+
+This lets the funded wallet "do something useful" on both legs of the farming loop — distributing L2 balance via deposits, and distributing L1 balance via withdraws — while still producing on-chain activity. Once a worker is topped up above the threshold on a given chain, it stops being prioritized for that chain and starts running its own activity in subsequent cycles.
+
+Non-main wallets ignore this logic entirely — they always send to a single recipient (sender's own address by default for bridge, explorer pool for transfer). Setting `--to <addr>` on `bridge` also forces a single recipient and skips the priority queue.
 
 #### Storage & safety
 
@@ -246,7 +255,7 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `AUTO_TRANSFER_AMOUNT_MIN` / `_MAX` | no | Random amount range used by `auto` for transfers (defaults `0.0001` / `0.0013`). |
 | `AUTO_BRIDGE_AMOUNT_MIN`   / `_MAX` | no | Random amount range used by `auto` for bridges (defaults `0.0001` / `0.0013`). |
 | `AUTO_COOLDOWN_HOURS`              | no | Sleep duration between auto cycles (default `24`). Fractional values OK for testing. |
-| `MAIN_TOPUP_THRESHOLD`             | no | Threshold (in ETH) below which a generated wallet is prioritized as a recipient when the main account runs `transfer`/`auto`. Default `0.005`. Set to `0` to disable. |
+| `MAIN_TOPUP_THRESHOLD`             | no | Threshold (in ETH) below which a generated wallet is prioritized as a recipient when the main account runs `transfer`, `bridge`, or `auto` without an explicit `--to`. For `bridge`, the threshold is checked against the *destination* chain's balance. Default `0.005`. Set to `0` to disable. |
 
 \*Or use `wallets.txt`.
 
