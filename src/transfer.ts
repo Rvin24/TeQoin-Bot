@@ -77,6 +77,7 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     const totalRecipientsNeeded = count * selected.length;
     const fixedRecipient = (flags.to ?? "").trim();
     let recipients: string[];
+    let recipientPool: string[] = [];
     if (fixedRecipient) {
       validateAddress(fixedRecipient);
       recipients = Array(totalRecipientsNeeded).fill(fixedRecipient.toLowerCase());
@@ -84,12 +85,12 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     } else {
       console.log(`Fetching recipient pool from ${chain.name} explorer…`);
       const exclude = wallets.map((w) => w.address);
-      const pool = await fetchAddressPool(exclude, { env });
-      console.log(`  pool size: ${pool.length} unique addresses (excluding your ${wallets.length} wallet${wallets.length === 1 ? "" : "s"}).`);
-      if (pool.length === 0) {
+      recipientPool = await fetchAddressPool(exclude, { env });
+      console.log(`  pool size: ${recipientPool.length} EOA address${recipientPool.length === 1 ? "" : "es"} (excluding your ${wallets.length} wallet${wallets.length === 1 ? "" : "s"}).`);
+      if (recipientPool.length === 0) {
         throw new Error("Recipient pool is empty. Pass --to <addr> to use a fixed recipient instead.");
       }
-      recipients = sampleRecipients(pool, totalRecipientsNeeded);
+      recipients = sampleRecipients(recipientPool, totalRecipientsNeeded);
     }
 
     // Summary.
@@ -141,19 +142,44 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
       }
       console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — sending ${count} tx…`);
       for (let k = 0; k < count; k++) {
-        const recipient = recipients[recipientIdx++]!;
-        try {
-          const req: TransactionRequest = { to: recipient, value };
-          await wallet.signer.estimateGas(req);
-          const tx = await wallet.signer.sendTransaction(req);
-          console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}  hash: ${tx.hash}`);
-          console.log(`        ${txUrl(chain, tx.hash)}`);
-          const receipt = await tx.wait(1);
-          const status = receipt?.status === 1 ? "confirmed" : "mined (status != 1)";
-          console.log(`        ${status} in block ${receipt?.blockNumber ?? "?"}`);
-          results.push({ wallet, recipient, status: "sent", hash: tx.hash });
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
+        const initial = recipients[recipientIdx++]!;
+        const tried = new Set<string>([initial]);
+        let recipient = initial;
+        // Up to 3 attempts: if estimateGas reverts (e.g. recipient is an
+        // unflagged contract that doesn't accept native ETH), pick another
+        // address from the pool and retry. Bail out on the 4th failure or
+        // on errors that aren't gas-estimation reverts (those usually
+        // indicate something other than a bad recipient — bad nonce,
+        // insufficient funds, network error — and retrying won't help).
+        let lastError: unknown;
+        let sent = false;
+        for (let attempt = 0; attempt < 4 && !sent; attempt++) {
+          try {
+            const req: TransactionRequest = { to: recipient, value };
+            await wallet.signer.estimateGas(req);
+            const tx = await wallet.signer.sendTransaction(req);
+            console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}  hash: ${tx.hash}`);
+            console.log(`        ${txUrl(chain, tx.hash)}`);
+            const receipt = await tx.wait(1);
+            const status = receipt?.status === 1 ? "confirmed" : "mined (status != 1)";
+            console.log(`        ${status} in block ${receipt?.blockNumber ?? "?"}`);
+            results.push({ wallet, recipient, status: "sent", hash: tx.hash });
+            sent = true;
+          } catch (err) {
+            lastError = err;
+            const next = pickRetryRecipient(recipientPool, tried);
+            const isEstimateGasRevert = err instanceof Error
+              && /estimateGas|CALL_EXCEPTION|missing revert data/i.test(err.message);
+            if (!isEstimateGasRevert || !next || fixedRecipient) {
+              break;
+            }
+            console.log(`  [${k + 1}/${count}] ${shortAddress(recipient)} reverted on estimateGas — retrying with another recipient…`);
+            tried.add(next);
+            recipient = next;
+          }
+        }
+        if (!sent) {
+          const message = lastError instanceof Error ? lastError.message : String(lastError);
           console.log(`  [${k + 1}/${count}] failed: ${message}`);
           results.push({ wallet, recipient, status: "failed", error: message });
         }
@@ -188,4 +214,16 @@ function validateAmount(raw: string): string {
     throw new Error(`Invalid --amount="${raw}". Must be a positive decimal (e.g. 0.001).`);
   }
   return raw;
+}
+
+/**
+ * Pick a recipient from `pool` that isn't in `tried`. Returns `undefined`
+ * when the pool is exhausted. Used by the broadcast loop to fall back to
+ * a different recipient after an estimateGas revert.
+ */
+function pickRetryRecipient(pool: readonly string[], tried: ReadonlySet<string>): string | undefined {
+  const remaining = pool.filter((addr) => !tried.has(addr));
+  if (remaining.length === 0) return undefined;
+  const idx = Math.floor(Math.random() * remaining.length);
+  return remaining[idx];
 }
