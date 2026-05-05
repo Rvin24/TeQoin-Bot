@@ -1,138 +1,133 @@
 # tequoin-bot
 
 Multi-chain transaction bot for **TeQoin L2** (chainId `420377`) and **Ethereum Sepolia** testnet.
-Supports multi-wallet, native-token transfer, balance checks, and an interactive CLI.
+Multi-wallet, looped transfers with auto-recipients from the block explorer, and a one-screen interactive menu.
 
-> ⚠ This is testnet tooling only. Do not put mainnet private keys in `.env`.
-
----
-
-## Features
-
-- **Two preconfigured chains**:
-  - TeQoin L2 — `chainId 420377`, RPC `https://rpc.teqoin.io`, explorer `https://develop.blockscan-7z6.pages.dev`
-  - Ethereum Sepolia — `chainId 11155111`, RPC `https://ethereum-sepolia-rpc.publicnode.com`, explorer `https://sepolia.etherscan.io`
-- **Multi-wallet** — load N private keys and run the same operation across one, several, or all of them.
-- **Native ETH transfer** — recipient + amount, with per-wallet balance pre-flight check, gas estimate, and explorer link printed for each tx.
-- **Interactive prompts** — chain picker, wallet picker, amount/recipient prompts when stdin is a TTY; falls back to flags / env vars in non-interactive (CI / cron / piped) runs.
-- **No mainnet by default** — only testnets are configured. RPC URLs are overridable via env if you self-host.
-- **Bridge (planned, fase 2)** — Sepolia ↔ TeQoin L2 via the TeQoin Telegram Mini App. Not yet implemented; see [Roadmap](#roadmap).
+> ⚠ Testnet tooling only. Do not put mainnet private keys in `.env`.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Install deps (Node 20+)
 pnpm install
+cp .env.example .env             # set PRIVATE_KEYS=0x...,0x...
+pnpm start                       # menu: 1) Balance 2) Transfer 3) Bridge 4) Help
+```
 
-# 2. Configure your wallets
-cp .env.example .env
-# edit .env and set PRIVATE_KEYS=0x...,0x...
+That's it. The menu drives everything.
 
-# 3. Check balances on TeQoin L2
+---
+
+## Menu
+
+```
+What do you want to do?
+   1. Check Balance       (TeQoin L2 + Sepolia, all wallets)
+   2. Transfer            (TeQoin L2, auto recipient from explorer)
+   3. Bridge              (Sepolia ↔ TeQoin L2 — coming soon)
+   4. Help
+```
+
+### 1. Check Balance
+
+Shows the native ETH balance of every loaded wallet on **both** TeQoin L2 and Sepolia, with explorer links and a per-chain total. One chain failing (e.g. RPC down) does not stop the other.
+
+### 2. Transfer
+
+Native ETH send on **TeQoin L2** only. The flow:
+
+1. Pick which wallet(s) to use — single index or `all`.
+2. **How many transactions per wallet?** (default 1)
+3. **Amount per transaction in ETH.**
+4. The bot fetches a recipient pool from `https://api.teqoin.io/api/v1/transaction/latest` (the indexer behind the TeQoin block explorer). Each tx in the batch goes to a different random address from this pool.
+   - Your own wallet addresses and the zero address are excluded.
+   - If the pool is smaller than the requested batch, the bot samples with replacement.
+5. Pre-flight balance check (skips a wallet if it can't cover `count × amount`).
+6. Confirmation prompt (skip with `--yes`).
+7. Per-tx broadcast with explorer link and status.
+
+### 3. Bridge
+
+Placeholder — prints what's planned and what data is already accessible via the indexer. Real implementation lands in a follow-up PR after the TeQoin Wallet Mini App's deposit/withdraw contracts have been mapped out.
+
+### 4. Help
+
+Same as `pnpm start help` — full flag/env reference.
+
+---
+
+## Wallet configuration
+
+Two sources are supported (env wins if both are set):
+
+```bash
+# .env
+PRIVATE_KEYS=0xabc...,0xdef...
+```
+
+```text
+# wallets.txt (one PK per line, gitignored, comments allowed)
+0xabc...
+# wallet 2
+0xdef...
+```
+
+Pick which one(s) to use at runtime via the picker, or with `--wallet 2` / `--wallet all`.
+
+---
+
+## Power-user CLI flags
+
+The interactive menu is the recommended UX, but every step is also flag-driven for scripting.
+
+```bash
+# Balance only on TeQoin (skip Sepolia round-trip)
 pnpm start balance --chain tequoin
 
-# 4. Send 0.001 ETH from wallet #1 to a recipient on TeQoin L2
-pnpm start transfer --chain tequoin --wallet 1 --to 0xRECIPIENT --amount 0.001
+# Transfer 5x 0.0001 ETH per wallet from every wallet, no confirmation, auto recipients
+pnpm start transfer --wallet all --count 5 --amount 0.0001 --yes
 
-# Or run interactively (no flags):
-pnpm start
-```
+# Transfer 3x to a fixed recipient (override explorer auto-pick)
+pnpm start transfer --wallet 1 --count 3 --amount 0.001 --to 0xRECIPIENT --yes
 
----
-
-## Configuration
-
-All configuration lives in `.env`. Copy from `.env.example`.
-
-| Variable           | Required | Description                                                                          |
-| ------------------ | -------- | ------------------------------------------------------------------------------------ |
-| `PRIVATE_KEYS`     | yes\*    | Comma-separated list of 0x-prefixed private keys (one per wallet).                   |
-| `CHAIN`            | no       | Default chain slug (`tequoin` or `sepolia`). Skips the chain picker.                 |
-| `TEQOIN_RPC_URL`   | no       | Override default TeQoin L2 RPC.                                                      |
-| `SEPOLIA_RPC_URL`  | no       | Override default Sepolia RPC.                                                        |
-| `TRANSFER_TO`      | no       | Default recipient for `transfer`.                                                    |
-| `TRANSFER_AMOUNT`  | no       | Default amount in ETH for `transfer`.                                                |
-
-\*Alternative: drop one private key per line in `wallets.txt` (gitignored). Loaded only if `PRIVATE_KEYS` is empty.
-
----
-
-## Commands
-
-### `transfer`
-
-Send native ETH to a single recipient from one or more wallets.
-
-```bash
-pnpm start transfer [--chain <slug>] [--wallet <n|all>] [--to <addr>] [--amount <eth>] [--yes]
-```
-
-| Flag         | Description                                                                |
-| ------------ | -------------------------------------------------------------------------- |
-| `--chain`    | `tequoin` or `sepolia`. If omitted, uses `CHAIN` env or interactive menu.  |
-| `--wallet`   | 1-based wallet index, or `all` to send from every loaded wallet.           |
-| `--to`       | Recipient address. Falls back to `TRANSFER_TO` env, else interactive.      |
-| `--amount`   | Amount in ETH (decimal string, e.g. `0.001`).                              |
-| `--yes`      | Skip the final confirmation prompt.                                        |
-
-The bot prints a summary, runs a balance pre-flight check (wallets with insufficient balance are skipped, not errored), then asks for confirmation before broadcasting. After each tx it prints both the hash and a clickable explorer link.
-
-### `balance`
-
-Show the native-token balance of every loaded wallet on the chosen chain, plus a total.
-
-```bash
-pnpm start balance [--chain <slug>]
-```
-
-### `help`
-
-```bash
+# Show full help / env reference
 pnpm start help
 ```
 
----
+| Command    | Flag             | Description                                                       |
+| ---------- | ---------------- | ----------------------------------------------------------------- |
+| `balance`  | `--chain <slug>` | Restrict to one chain (`tequoin` or `sepolia`).                   |
+| `transfer` | `--wallet <n\|all>` | 1-based wallet index, or `all` for batch.                      |
+| `transfer` | `--count <N>`    | Transactions per wallet. 1..1000.                                 |
+| `transfer` | `--amount <eth>` | Per-tx amount in ETH (decimal string).                            |
+| `transfer` | `--to <addr>`    | Override recipient (skip explorer auto-pick).                     |
+| `transfer` | `--yes`          | Skip confirmation prompt.                                         |
 
-## Examples
-
-**Send the same amount from all wallets to one recipient on Sepolia, no confirmation:**
-
-```bash
-pnpm start transfer \
-  --chain sepolia \
-  --wallet all \
-  --to 0x000000000000000000000000000000000000dEaD \
-  --amount 0.0005 \
-  --yes
-```
-
-**Run interactively on TeQoin L2:**
-
-```bash
-pnpm start transfer
-# → menu picks chain, wallet, recipient, amount, confirms
-```
-
-**Pin chain via env so you skip the picker every time:**
-
-```bash
-echo "CHAIN=tequoin" >> .env
-pnpm start balance     # never asks which chain
-```
+Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and never blocks on prompts.
 
 ---
 
-## Roadmap
+## Environment variables
 
-- [x] Multi-chain config (TeQoin L2 + Sepolia)
-- [x] Multi-wallet loader (env or file)
-- [x] Native transfer with explorer links
-- [x] Balance command
-- [ ] **Bridge Sepolia ↔ TeQoin L2** — TeQoin Wallet (Telegram Mini App at `app.teqoin.io`) currently exposes the bridge UI. We need to reverse-engineer the deposit/withdraw contract addresses and ABIs to script it. Tracking issue forthcoming.
-- [ ] ERC-20 transfer (configurable token list)
-- [ ] Tx history fetch (per wallet) via the explorer's API once it's published
+| Variable           | Required | Description                                                           |
+| ------------------ | -------- | --------------------------------------------------------------------- |
+| `PRIVATE_KEYS`     | yes\*    | Comma-separated 0x-prefixed keys.                                     |
+| `TEQOIN_RPC_URL`   | no       | Override default TeQoin L2 RPC (`https://rpc.teqoin.io`).             |
+| `SEPOLIA_RPC_URL`  | no       | Override default Sepolia RPC (`https://ethereum-sepolia-rpc.publicnode.com`). |
+| `TEQOIN_API_URL`   | no       | Override default TeQoin indexer API (`https://api.teqoin.io`).        |
+| `TRANSFER_AMOUNT`  | no       | Default amount in ETH if `--amount` is omitted.                       |
+
+\*Or use `wallets.txt`.
+
+---
+
+## TeQoin block explorer & indexer
+
+- **Frontend (SPA)**: `https://develop.blockscan-7z6.pages.dev`
+- **Indexer API**: `https://api.teqoin.io`
+
+The bot uses the indexer for recipient sourcing (`/api/v1/transaction/latest`) and exposes bridge endpoints (`/api/v1/bridge/latest`, `/api/v1/address/<addr>/bridge-history`) for the upcoming Bridge feature. See `src/explorer.ts`.
 
 ---
 
@@ -142,25 +137,37 @@ pnpm start balance     # never asks which chain
 src/
   chains.ts     # chain profiles + explorer URL helpers
   rpc.ts        # provider factory + chainId sanity check
-  wallet.ts    # multi-wallet loader (env or wallets.txt)
-  prompt.ts    # interactive prompts (TTY-aware)
-  cli.ts       # argv parser
-  transfer.ts  # transfer command
-  balance.ts   # balance command
-  index.ts     # CLI entry point
+  wallet.ts     # multi-wallet loader (env or wallets.txt)
+  prompt.ts     # interactive prompts (TTY-aware) + main-menu picker
+  cli.ts        # argv parser
+  explorer.ts   # TeQoin indexer client + recipient pool sampling
+  balance.ts    # balance command (both chains in one shot)
+  transfer.ts   # transfer command (TeQoin-only, looped, auto-recipients)
+  bridge.ts     # bridge command (placeholder; real impl in a follow-up PR)
+  index.ts      # CLI entry point + main-menu dispatcher
 ```
+
+---
+
+## Roadmap
+
+- [x] Multi-chain config (TeQoin L2 + Sepolia)
+- [x] Multi-wallet loader (env or file)
+- [x] Native transfer with explorer links
+- [x] One-screen menu (`pnpm start`)
+- [x] Multi-chain balance in one call
+- [x] Looped transfers with `count`
+- [x] Auto-recipient sourcing from the TeQoin indexer
+- [ ] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw via TeQoin Wallet contracts)
+- [ ] ERC-20 transfer (configurable token list)
+- [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)
 
 ---
 
 ## Security notes
 
 - **Never commit `.env` or `wallets.txt`.** Both are in `.gitignore`. Treat private keys like passwords.
-- This bot is intended for **testnet** wallets only. The default chains have no production value at risk.
-- All RPC traffic is HTTPS. RPC overrides are read from env vars and never written to disk.
-- The bot performs a `chainId` sanity check on every run to catch RPC misconfiguration.
-
----
-
-## License
-
-MIT (or whatever the repo settings dictate).
+- Testnet wallets only. The default chains have no production value at risk.
+- All RPC + API traffic is HTTPS.
+- The bot performs a `chainId` sanity check before signing any tx.
+- Recipients fetched from the explorer are real addresses with on-chain activity, so they may be ordinary EOAs OR contracts. Sending native ETH to a contract that doesn't accept it will revert and burn gas (the bot does an `estimateGas` round-trip to surface that before broadcast).

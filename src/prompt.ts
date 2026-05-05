@@ -174,3 +174,42 @@ export async function confirm(question: string, defaultYes = false): Promise<boo
   if (ans === "") return defaultYes;
   return ans === "y" || ans === "yes";
 }
+
+/**
+ * Prompt for a positive integer count (e.g. how many transactions to send).
+ * Falls back to `defaultValue` when run non-interactively or the user just
+ * presses Enter on the prompt.
+ */
+export async function askCount(label: string, defaultValue = 1): Promise<number> {
+  if (!isTTY()) return defaultValue;
+  for (;;) {
+    const ans = (await ask(`${label} [${defaultValue}]: `)).trim();
+    if (ans === "") return defaultValue;
+    const n = Number(ans);
+    if (Number.isInteger(n) && n >= 1 && n <= 1000) return n;
+    console.log("  → invalid count. Must be a positive integer (1..1000).");
+  }
+}
+
+/**
+ * Top-level main-menu picker.
+ *
+ * Returns one of "balance" | "transfer" | "bridge" | "help".
+ * Non-TTY callers should pass the command via argv instead.
+ */
+export async function pickMainAction(): Promise<"balance" | "transfer" | "bridge" | "help"> {
+  if (!isTTY()) return "help";
+  console.log("\nWhat do you want to do?");
+  console.log("   1. Check Balance       (TeQoin L2 + Sepolia, all wallets)");
+  console.log("   2. Transfer            (TeQoin L2, auto recipient from explorer)");
+  console.log("   3. Bridge              (Sepolia ↔ TeQoin L2 — coming soon)");
+  console.log("   4. Help");
+  for (;;) {
+    const ans = (await ask("Choice [1]: ")).trim().toLowerCase();
+    if (ans === "" || ans === "1" || ans === "balance") return "balance";
+    if (ans === "2" || ans === "transfer") return "transfer";
+    if (ans === "3" || ans === "bridge") return "bridge";
+    if (ans === "4" || ans === "help" || ans === "?") return "help";
+    console.log("  → invalid choice. Type 1, 2, 3, or 4.");
+  }
+}
