@@ -68,13 +68,33 @@ interface TransferResult {
   error?: string;
 }
 
+/**
+ * Per-address counters accumulated over a single `runTransfer` call.
+ *
+ * Keys are lowercased addresses. Counters only include *successfully
+ * broadcast* transfers (status === "sent"); skipped or failed tx do
+ * not contribute. Receivers are credited per-tx so a wallet that
+ * received N transfers in this run shows up with `receivesByAddress[a] = N`.
+ *
+ * The auto-24h orchestrator merges these across cycles and feeds them
+ * into the cooldown dashboard's TePoints calculation.
+ */
+export interface TransferRunStats {
+  sendsByAddress: Record<string, number>;
+  receivesByAddress: Record<string, number>;
+}
+
 const TRANSFER_CHAIN: ChainProfile = (() => {
   const c = getChainBySlug("tequoin");
   if (!c) throw new Error("TeQoin L2 chain config missing.");
   return c;
 })();
 
-export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function runTransfer(
+  flags: TransferFlags = {},
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<TransferRunStats> {
+  const stats: TransferRunStats = { sendsByAddress: {}, receivesByAddress: {} };
   const chain = TRANSFER_CHAIN;
   const provider = buildProvider(chain, env);
 
@@ -179,7 +199,7 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
       : await confirm(`\nBroadcast ${totalRecipientsNeeded} transaction${totalRecipientsNeeded === 1 ? "" : "s"}?`, false);
     if (!proceed) {
       console.log("Aborted (no transactions broadcast).");
-      return;
+      return stats;
     }
 
     // Broadcast.
@@ -241,6 +261,10 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
             const status = receipt?.status === 1 ? "confirmed" : "mined (status != 1)";
             console.log(`        ${status} in block ${receipt?.blockNumber ?? "?"}`);
             results.push({ wallet, recipient, status: "sent", hash: tx.hash });
+            const senderKey = wallet.address.toLowerCase();
+            const recipientKey = recipient.toLowerCase();
+            stats.sendsByAddress[senderKey] = (stats.sendsByAddress[senderKey] ?? 0) + 1;
+            stats.receivesByAddress[recipientKey] = (stats.receivesByAddress[recipientKey] ?? 0) + 1;
             sent = true;
           } catch (err) {
             lastError = err;
@@ -267,6 +291,7 @@ export async function runTransfer(flags: TransferFlags = {}, env: NodeJS.Process
     const skipped = results.filter((r) => r.status === "skipped").length;
     const failed = results.filter((r) => r.status === "failed").length;
     console.log(`\nDone. ${sent} sent, ${skipped} skipped, ${failed} failed.`);
+    return stats;
   } finally {
     provider.destroy();
   }

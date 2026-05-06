@@ -26,13 +26,26 @@
  * bridge mode are gathered at startup from the user.
  */
 
+import { formatEther } from "ethers";
 import { askCount, askBridgeMode, pickWallets, confirm } from "./prompt.js";
-import { runTransfer } from "./transfer.js";
-import { runBridge } from "./bridge.js";
-import { loadWallets } from "./wallet.js";
+import { runTransfer, type TransferRunStats } from "./transfer.js";
+import { runBridge, type BridgeRunStats } from "./bridge.js";
+import { loadWallets, type LoadedWallet } from "./wallet.js";
 import { buildProvider } from "./rpc.js";
 import { getChainBySlug, type ChainProfile } from "./chains.js";
 import { validateRange, type RandomEthRange } from "./random.js";
+import {
+  POINTS_PER_TX,
+  formatEthForTable,
+  renderAutoDashboard,
+  totalTePoints,
+  type AutoDashboardRow,
+} from "./dashboard.js";
+import {
+  loadPersistedStats,
+  savePersistedStats,
+  statsStorePath,
+} from "./statsStore.js";
 
 export interface AutoFlags {
   /** 1-based wallet index, or "all". */
@@ -76,6 +89,18 @@ export async function runAuto(flags: AutoFlags = {}, env: NodeJS.ProcessEnv = pr
     }
   }
 
+  // Per-address running totals across all cycles. Loaded from
+  // ./auto-stats.json so they survive restarts; saved back to disk
+  // after every cycle. Delete the file to reset.
+  const totals: PerAddressTotals = loadPersistedStats();
+  const persistPath = statsStorePath();
+  const persistedAddresses = Object.keys(totals).length;
+  if (persistedAddresses > 0) {
+    console.log(`\nLoaded persisted activity stats for ${persistedAddresses} address${persistedAddresses === 1 ? "" : "es"} from ${persistPath}.`);
+  } else {
+    console.log(`\nNo persisted activity stats found at ${persistPath} — starting from zero.`);
+  }
+
   let cycleIndex = 0;
   for (;;) {
     cycleIndex++;
@@ -84,7 +109,15 @@ export async function runAuto(flags: AutoFlags = {}, env: NodeJS.ProcessEnv = pr
     console.log(`CYCLE #${cycleIndex} starting at ${cycleStart.toISOString()}`);
     console.log("=".repeat(72));
 
-    await runCycle(config, env);
+    const cycleStats = await runCycle(config, env);
+    mergeStats(totals, cycleStats);
+
+    // Persist before sleeping so a forced exit during the cooldown
+    // (Ctrl+C, OS signal) keeps the activity we just performed.
+    savePersistedStats(totals);
+
+    // Dashboard: refresh balances on both chains and print TePoints.
+    await printCooldownDashboard(totals, env);
 
     const next = new Date(Date.now() + config.cooldownHours * 3_600_000);
     console.log(`\nCycle #${cycleIndex} complete. Sleeping ${config.cooldownHours}h.`);
@@ -93,11 +126,72 @@ export async function runAuto(flags: AutoFlags = {}, env: NodeJS.ProcessEnv = pr
   }
 }
 
-async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<void> {
+/**
+ * Per-wallet activity counters that survive across auto-loop cycles.
+ * Keys are lowercased addresses. Each entry is the running total since
+ * the auto loop was started in this process; the cooldown dashboard
+ * reads from this and feeds it into TePoints.
+ */
+type PerAddressTotals = Record<string, { send: number; recv: number; bridge: number }>;
+
+interface CycleStats {
+  transfer: TransferRunStats;
+  bridges: BridgeRunStats[];
+}
+
+function emptyAddrEntry(): { send: number; recv: number; bridge: number } {
+  return { send: 0, recv: 0, bridge: 0 };
+}
+
+/**
+ * Fold a finished cycle's TransferRunStats and BridgeRunStats into the
+ * running per-address totals. The categories follow the TeQoin Mini
+ * App's incentive program (1k points per send/receive/bridge):
+ *
+ *   send   = transfers initiated by this address on TeQoin L2
+ *   recv   = transfers received on TeQoin L2 + deposit-bridge credits
+ *            on TeQoin L2 (deposit recipient)
+ *   bridge = bridges initiated by this address (deposit + withdraw)
+ *
+ * Deposit credits are merged into `recv` rather than tracked separately
+ * because the mini app awards "each receive" points regardless of
+ * whether the inbound tx was a transfer or a deposit landing.
+ */
+function mergeStats(totals: PerAddressTotals, cycle: CycleStats): void {
+  const ensure = (addr: string): { send: number; recv: number; bridge: number } => {
+    let entry = totals[addr];
+    if (!entry) {
+      entry = emptyAddrEntry();
+      totals[addr] = entry;
+    }
+    return entry;
+  };
+  for (const [addr, n] of Object.entries(cycle.transfer.sendsByAddress)) {
+    ensure(addr).send += n;
+  }
+  for (const [addr, n] of Object.entries(cycle.transfer.receivesByAddress)) {
+    ensure(addr).recv += n;
+  }
+  for (const bridge of cycle.bridges) {
+    for (const [addr, n] of Object.entries(bridge.bridgesByAddress)) {
+      ensure(addr).bridge += n;
+    }
+    for (const [addr, n] of Object.entries(bridge.depositReceivesByAddress)) {
+      ensure(addr).recv += n;
+    }
+  }
+}
+
+async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<CycleStats> {
+  const cycle: CycleStats = {
+    transfer: { sendsByAddress: {}, receivesByAddress: {} },
+    bridges: [],
+  };
+
   // Phase 1: transfers (TeQoin L2)
   console.log(`\n--- Phase 1/2: ${config.transfersPerWallet} transfer(s) per wallet ---`);
   try {
-    await runTransfer({
+    cycle.transfer = await runTransfer({
       wallet: config.walletSelector,
       count: String(config.transfersPerWallet),
       randomMin: config.transferRange.min,
@@ -117,7 +211,7 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<voi
   for (const direction of directions) {
     console.log(`\n--- Phase 2/2: ${config.bridgesPerWallet} ${direction} bridge(s) per wallet ---`);
     try {
-      await runBridge({
+      const bridgeStats = await runBridge({
         direction,
         wallet: config.walletSelector,
         count: String(config.bridgesPerWallet),
@@ -125,11 +219,86 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<voi
         randomMax: config.bridgeRange.max,
         yes: true,
       }, env);
+      cycle.bridges.push(bridgeStats);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.log(`Bridge ${direction} phase failed: ${message}. Continuing.`);
     }
   }
+  return cycle;
+}
+
+/**
+ * Render the cooldown dashboard. Re-loads wallets (so newly-generated
+ * worker wallets show up after a `create` invocation between cycles)
+ * and queries fresh balances on both chains, then folds in the
+ * accumulated activity counters before delegating to the table
+ * renderer in dashboard.ts.
+ *
+ * RPC errors on a chain degrade gracefully — the offending column
+ * shows "err" but the rest of the table still renders.
+ */
+async function printCooldownDashboard(
+  totals: PerAddressTotals,
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
+  const tequoin = mustChain("tequoin");
+  const sepolia = mustChain("sepolia");
+  const teqoinProvider = buildProvider(tequoin, env);
+  const sepoliaProvider = buildProvider(sepolia, env);
+  let wallets: readonly LoadedWallet[];
+  try {
+    wallets = loadWallets(teqoinProvider, { env });
+  } catch (err) {
+    teqoinProvider.destroy();
+    sepoliaProvider.destroy();
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`\n(Dashboard skipped: failed to load wallets — ${message})`);
+    return;
+  }
+
+  const safeBalance = async (
+    provider: ReturnType<typeof buildProvider>,
+    addr: string,
+  ): Promise<string> => {
+    try {
+      const wei = await provider.getBalance(addr);
+      return formatEthForTable(formatEther(wei));
+    } catch {
+      return "err";
+    }
+  };
+
+  let teqoinBalances: string[];
+  let sepoliaBalances: string[];
+  try {
+    [teqoinBalances, sepoliaBalances] = await Promise.all([
+      Promise.all(wallets.map((w) => safeBalance(teqoinProvider, w.address))),
+      Promise.all(wallets.map((w) => safeBalance(sepoliaProvider, w.address))),
+    ]);
+  } finally {
+    teqoinProvider.destroy();
+    sepoliaProvider.destroy();
+  }
+
+  const rows: AutoDashboardRow[] = wallets.map((w, i) => {
+    const entry = totals[w.address.toLowerCase()] ?? emptyAddrEntry();
+    return {
+      index: w.index,
+      address: w.address,
+      tequoin: teqoinBalances[i] ?? "err",
+      sepolia: sepoliaBalances[i] ?? "err",
+      send: entry.send,
+      recv: entry.recv,
+      bridge: entry.bridge,
+    };
+  });
+
+  console.log(`\nDashboard — balances now (ETH), activity counters cumulative across runs:`);
+  console.log(renderAutoDashboard(rows));
+  const grandTotal = totalTePoints(rows);
+  console.log(`  Grand total TePoints: ${grandTotal.toLocaleString("en-US")} (${POINTS_PER_TX.toLocaleString("en-US")} per send/recv/bridge tx)`);
+  console.log(`  Saved to ${statsStorePath()} (delete the file to reset).`);
 }
 
 async function gatherConfig(flags: AutoFlags, env: NodeJS.ProcessEnv): Promise<AutoConfig> {

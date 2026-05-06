@@ -8,9 +8,10 @@
  */
 
 import { formatEther, type JsonRpcProvider } from "ethers";
-import { CHAINS, addressUrl, type ChainProfile } from "./chains.js";
+import { CHAINS, type ChainProfile } from "./chains.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
-import { loadWallets, shortAddress, type LoadedWallet } from "./wallet.js";
+import { loadWallets, type LoadedWallet } from "./wallet.js";
+import { renderBalanceDashboard, formatEthForTable, type BalanceDashboardRow } from "./dashboard.js";
 
 export interface BalanceFlags {
   /** Restrict to a single chain. Empty = all configured chains. */
@@ -71,40 +72,60 @@ export async function runBalance(flags: BalanceFlags = {}, env: NodeJS.ProcessEn
   if (wallets.length === 0) throw new Error("No wallets loaded.");
 
   console.log(`\nChecking balances for ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} ` +
-    `across ${targetChains.length} chain${targetChains.length === 1 ? "" : "s"}…\n`);
+    `across ${targetChains.length} chain${targetChains.length === 1 ? "" : "s"}…`);
 
   const results = await Promise.all(targetChains.map((c) => balancesForChain(c, wallets, env)));
 
-  for (const result of results) {
+  // Header line per chain (block / RPC error).
+  const headerLines = results.map((result) => {
     const headerSuffix = result.error
-      ? `  (RPC error: ${result.error})`
-      : `  (block ${result.blockNumber})`;
-    console.log(`── ${result.chain.name} (chainId ${result.chain.chainId})${headerSuffix}`);
+      ? `(RPC error: ${result.error})`
+      : `(block ${result.blockNumber})`;
+    return `  ${result.chain.name} (chainId ${result.chain.chainId})  ${headerSuffix}`;
+  });
+  console.log(headerLines.join("\n") + "\n");
 
-    if (result.error) {
-      console.log("  could not fetch balances on this chain.\n");
-      continue;
-    }
+  // Build dashboard rows. The dashboard hard-codes columns for TeQoin
+  // and Sepolia (the user only ever runs against those two chains), so
+  // we look them up by slug rather than building a generic NxM table.
+  const teqoinResult = results.find((r) => r.chain.slug === "tequoin");
+  const sepoliaResult = results.find((r) => r.chain.slug === "sepolia");
+  const cellFor = (
+    result: ChainBalances | undefined,
+    walletIdx: number,
+  ): string => {
+    if (!result) return "-";
+    if (result.error) return "err";
+    const bal = result.balances[walletIdx];
+    if (bal === undefined) return "err";
+    return formatEthForTable(formatEther(bal));
+  };
 
-    let total = 0n;
-    let totalKnown = true;
-    wallets.forEach((w, i) => {
-      const bal = result.balances[i];
-      if (bal === undefined) {
-        totalKnown = false;
-        console.log(`  #${w.index} ${shortAddress(w.address)}  ${"(error)".padStart(20)} ${result.chain.symbol}`);
-        return;
+  const rows: BalanceDashboardRow[] = wallets.map((w, i) => ({
+    index: w.index,
+    address: w.address,
+    tequoin: cellFor(teqoinResult, i),
+    sepolia: cellFor(sepoliaResult, i),
+  }));
+  console.log(renderBalanceDashboard(rows));
+
+  // Per-chain totals beneath the table when there is more than one
+  // wallet, so the user can still see aggregate holdings at a glance.
+  if (wallets.length > 1) {
+    const totalLine = (label: string, result: ChainBalances | undefined): string => {
+      if (!result || result.error) return `  ${label.padEnd(15)} n/a`;
+      let total = 0n;
+      let known = true;
+      for (const bal of result.balances) {
+        if (bal === undefined) { known = false; break; }
+        total += bal;
       }
-      total += bal;
-      console.log(
-        `  #${w.index} ${shortAddress(w.address)}  ${formatEther(bal).padStart(20)} ${result.chain.symbol}` +
-        `   ${addressUrl(result.chain, w.address)}`,
-      );
-    });
-
-    if (wallets.length > 1 && totalKnown) {
-      console.log(`  total${" ".repeat(14)}${formatEther(total).padStart(20)} ${result.chain.symbol}`);
-    }
+      if (!known) return `  ${label.padEnd(15)} (partial)`;
+      return `  ${label.padEnd(15)} ${formatEthForTable(formatEther(total))} ${result.chain.symbol}`;
+    };
     console.log();
+    console.log(totalLine("Total TeQoin:", teqoinResult));
+    console.log(totalLine("Total Sepolia:", sepoliaResult));
   }
+  console.log();
 }
