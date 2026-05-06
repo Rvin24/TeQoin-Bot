@@ -36,9 +36,26 @@ import { type LoadedWallet, shortAddress, loadWallets, summarizeWalletSources } 
 import { buildProvider, assertChainMatches } from "./rpc.js";
 import { pickWallets, askAmount, askCount, askTransferChain, confirm } from "./prompt.js";
 import { fetchAddressPool, sampleRecipients } from "./explorer.js";
-import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
+import { computeScaledRange, pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 
 const DEFAULT_TOPUP_THRESHOLD_ETH = "0.005";
+
+/**
+ * Default per-tx fee headroom we leave when auto-scaling random amounts
+ * to fit a wallet's balance. Conservative; intended to cover one native
+ * transfer's gas cost on the source chain plus a safety margin.
+ *
+ *   tequoin : ~0.000001 ETH  (TeQoin L2 base fee is in the single-digit
+ *             wei range, so 1e-6 ETH is several orders of magnitude
+ *             above what's actually consumed)
+ *   sepolia : ~0.0001 ETH   (~5 gwei × 21000 gas worst case)
+ *
+ * Override via TEQOIN_TRANSFER_GAS_RESERVE / SEPOLIA_TRANSFER_GAS_RESERVE.
+ */
+const DEFAULT_GAS_RESERVE_PER_TX_ETH: Record<string, string> = {
+  tequoin: "0.000001",
+  sepolia: "0.0001",
+};
 
 export interface TransferFlags {
   /** 1-based wallet index, or "all". Defaults to interactive picker. */
@@ -213,9 +230,63 @@ export async function runTransfer(
 
     const totalRecipientsNeeded = count * selected.length;
 
+    // Per-wallet pre-flight balance check. For the random-range case we
+    // *auto-scale* the per-tx amount to fit each wallet individually
+    // instead of skipping wallets that can't afford the worst-case
+    // (count × default_max). For the fixed-amount case we still require
+    // the full count × amount as before.
+    const balances = await Promise.all(selected.map((w) => provider.getBalance(w.address)));
+    const gasReservePerTxWei = resolveGasReservePerTx(chain.slug, env);
+    interface WalletPlan {
+      effectiveRange: RandomEthRange | undefined;
+      requiredWei: bigint;
+      skipReason?: string;
+      scaled: boolean;
+      scaleNote?: string;
+    }
+    const walletPlans: WalletPlan[] = selected.map((_w, i) => {
+      const balance = balances[i] ?? 0n;
+      if (randomRange) {
+        const r = computeScaledRange({
+          balanceWei: balance,
+          count,
+          defaultRange: randomRange,
+          gasReservePerTxWei,
+        });
+        if (!r.range) {
+          return {
+            effectiveRange: undefined,
+            requiredWei: 0n,
+            skipReason: r.reason ?? "insufficient balance",
+            scaled: false,
+          };
+        }
+        const requiredWei =
+          parseEther(r.range.max) * BigInt(count) + gasReservePerTxWei * BigInt(count);
+        return {
+          effectiveRange: r.range,
+          requiredWei,
+          scaled: r.scaled,
+          scaleNote: r.scaled ? r.reason : undefined,
+        };
+      }
+      // Fixed amount: legacy behavior. Skip if not enough.
+      const fixedWei = fixedValue ?? 0n;
+      const requiredWei = fixedWei * BigInt(count) + gasReservePerTxWei * BigInt(count);
+      const skip = balance < requiredWei;
+      return {
+        effectiveRange: undefined,
+        requiredWei,
+        skipReason: skip
+          ? `balance ${formatEther(balance)} ETH < required ${formatEther(requiredWei)} ETH for ${count} tx at ${fixedAmount ?? "?"} ETH`
+          : undefined,
+        scaled: false,
+      };
+    });
+
     // Summary.
     const amountLabel = randomRange
-      ? `random ${randomRange.min}–${randomRange.max} ${chain.symbol} per tx`
+      ? `random ${randomRange.min}–${randomRange.max} ${chain.symbol} per tx (auto-scaled per wallet to fit balance)`
       : `${fixedAmount} ${chain.symbol}`;
     const recipientsLabel = fixedRecipient
       ? "fixed (--to)"
@@ -231,19 +302,19 @@ export async function runTransfer(
     console.log(`  Amount / tx  : ${amountLabel}`);
     console.log(`  Total tx     : ${totalRecipientsNeeded}`);
     console.log(`  Recipients   : ${recipientsLabel}`);
-
-    // Per-wallet pre-flight balance check. For the random-range case we
-    // budget the *worst case* (count × max) so a wallet that just barely
-    // covers the upper bound isn't surprised mid-batch.
-    const perTxBudget = randomRange ? parseEther(randomRange.max) : (fixedValue ?? 0n);
-    const required = perTxBudget * BigInt(count);
-    const balances = await Promise.all(selected.map((w) => provider.getBalance(w.address)));
+    if (randomRange) {
+      console.log(`  Gas reserve  : ${formatEther(gasReservePerTxWei)} ${chain.symbol}/tx (override via ${gasReserveEnvVar(chain.slug)})`);
+    }
     selected.forEach((w, i) => {
       const bal = balances[i] ?? 0n;
-      const ok = bal >= required;
+      const plan = walletPlans[i]!;
+      const note = plan.skipReason
+        ? `  ⚠ will skip — ${plan.skipReason}`
+        : plan.scaled && plan.effectiveRange
+          ? `  ↳ scaled range ${plan.effectiveRange.min}–${plan.effectiveRange.max} ${chain.symbol}/tx`
+          : "";
       console.log(
-        `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${chain.symbol}` +
-        (ok ? "" : `  ⚠ need up to ${formatEther(required)} for batch — will skip`),
+        `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${chain.symbol}${note}`,
       );
     });
 
@@ -264,7 +335,7 @@ export async function runTransfer(
     const topupCursor = { i: 0 };
     for (let wi = 0; wi < selected.length; wi++) {
       const wallet = selected[wi]!;
-      const balance = balances[wi] ?? 0n;
+      const plan = walletPlans[wi]!;
       const recipientsForWallet = buildRecipientsForWallet({
         wallet,
         count,
@@ -273,19 +344,23 @@ export async function runTransfer(
         topupQueue,
         topupCursor,
       });
-      if (balance < required) {
+      if (plan.skipReason) {
         for (let k = 0; k < count; k++) {
           results.push({
             wallet,
             recipient: recipientsForWallet[k] ?? "0x",
             status: "skipped",
-            error: "insufficient balance for batch",
+            error: plan.skipReason,
           });
         }
-        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped (insufficient balance for batch).`);
+        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped: ${plan.skipReason}.`);
         continue;
       }
-      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — sending ${count} tx…`);
+      const walletRange = plan.effectiveRange;
+      const scaledNote = plan.scaled && walletRange
+        ? `  (scaled range ${walletRange.min}–${walletRange.max} ${chain.symbol})`
+        : "";
+      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — sending ${count} tx…${scaledNote}`);
       for (let k = 0; k < count; k++) {
         const initial = recipientsForWallet[k]!;
         const tried = new Set<string>([initial]);
@@ -293,7 +368,9 @@ export async function runTransfer(
         // Pick the per-tx amount once for this slot. Retries below reuse
         // the same value so a successful retry sends what the user
         // would expect; a fresh roll happens only on the next slot.
-        const txAmount = randomRange ? pickRandomAmount(randomRange) : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
+        const txAmount = walletRange
+          ? pickRandomAmount(walletRange)
+          : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
         // Up to 3 attempts: if estimateGas reverts (e.g. recipient is an
         // unflagged contract that doesn't accept native ETH), pick another
         // address from the pool and retry. Bail out on the 4th failure or
@@ -307,7 +384,7 @@ export async function runTransfer(
             const req: TransactionRequest = { to: recipient, value: txAmount.wei };
             await wallet.signer.estimateGas(req);
             const tx = await wallet.signer.sendTransaction(req);
-            const amountSuffix = randomRange ? `  (${txAmount.eth} ${chain.symbol})` : "";
+            const amountSuffix = walletRange ? `  (${txAmount.eth} ${chain.symbol})` : "";
             console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}${amountSuffix}  hash: ${tx.hash}`);
             console.log(`        ${txUrl(chain, tx.hash)}`);
             const receipt = await tx.wait(1);
@@ -430,6 +507,35 @@ function buildRecipientsForWallet(args: {
  * is alone is treated as a user error. Returns `undefined` when neither
  * is set, otherwise a validated range.
  */
+/**
+ * Env var name for the per-tx gas reserve override on a given chain.
+ * Hard-coded (rather than derived from `slug.toUpperCase()`) to keep
+ * the brand spelling "TEQOIN" consistent across env vars even though
+ * the chain slug carries an extra "u" for historical reasons.
+ */
+const TRANSFER_GAS_RESERVE_ENV_VAR: Record<string, string> = {
+  tequoin: "TEQOIN_TRANSFER_GAS_RESERVE",
+  sepolia: "SEPOLIA_TRANSFER_GAS_RESERVE",
+};
+
+function gasReserveEnvVar(chainSlug: string): string {
+  return TRANSFER_GAS_RESERVE_ENV_VAR[chainSlug] ?? `${chainSlug.toUpperCase()}_TRANSFER_GAS_RESERVE`;
+}
+
+/**
+ * Resolve the per-tx gas reserve (in wei) used by the random-range
+ * scaler. Reads `${SLUG}_TRANSFER_GAS_RESERVE` from env (decimal ETH
+ * string) and falls back to the chain-specific default.
+ */
+function resolveGasReservePerTx(chainSlug: string, env: NodeJS.ProcessEnv): bigint {
+  const fallback = DEFAULT_GAS_RESERVE_PER_TX_ETH[chainSlug] ?? "0";
+  const raw = env[gasReserveEnvVar(chainSlug)]?.trim() || fallback;
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(raw) || Number(raw) < 0) {
+    throw new Error(`Invalid ${gasReserveEnvVar(chainSlug)}="${raw}". Must be a non-negative decimal (e.g. 0.0001).`);
+  }
+  return parseEther(raw);
+}
+
 function resolveRandomRange(flags: TransferFlags): RandomEthRange | undefined {
   const min = flags.randomMin?.trim();
   const max = flags.randomMax?.trim();
