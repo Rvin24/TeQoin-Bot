@@ -226,6 +226,25 @@ export async function pickMainAction(): Promise<MainAction> {
  * "both" (does N deposits AND N withdrawals per wallet per cycle).
  * Non-TTY callers should pass via flag.
  */
+/**
+ * Picker specific to the `transfer` command: only TeQoin and Sepolia
+ * are valid choices, default is TeQoin (preserves the historical
+ * single-chain UX). Returns the chain *slug* so the caller can pass
+ * it down through `TransferFlags.chain`.
+ */
+export async function askTransferChain(): Promise<"tequoin" | "sepolia"> {
+  if (!isTTY()) return "tequoin";
+  console.log("Pick a chain for transfer:");
+  console.log("   1. tequoin   — TeQoin L2 (recipients auto from explorer)");
+  console.log("   2. sepolia   — Ethereum Sepolia (recipients = workers below threshold)");
+  for (;;) {
+    const ans = (await ask(`Chain [1]: `)).toLowerCase();
+    if (ans === "" || ans === "1" || ans === "tequoin") return "tequoin";
+    if (ans === "2" || ans === "sepolia") return "sepolia";
+    console.log(`  → invalid choice. Type 1 / tequoin / 2 / sepolia.`);
+  }
+}
+
 export async function askBridgeMode(): Promise<"deposit" | "withdraw" | "both"> {
   if (!isTTY()) return "both";
   console.log("\nBridge direction for the cycle:");

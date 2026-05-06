@@ -26,6 +26,8 @@
  * bridge mode are gathered at startup from the user.
  */
 
+import { writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { formatEther } from "ethers";
 import { askCount, askBridgeMode, pickWallets, confirm } from "./prompt.js";
 import { runTransfer, type TransferRunStats } from "./transfer.js";
@@ -36,9 +38,9 @@ import { getChainBySlug, type ChainProfile } from "./chains.js";
 import { validateRange, type RandomEthRange } from "./random.js";
 import {
   POINTS_PER_TX,
+  aggregateActivity,
   formatEthForTable,
   renderAutoDashboard,
-  totalTePoints,
   type AutoDashboardRow,
 } from "./dashboard.js";
 import {
@@ -46,6 +48,9 @@ import {
   savePersistedStats,
   statsStorePath,
 } from "./statsStore.js";
+
+const DEFAULT_DASHBOARD_LIMIT = 10;
+const DASHBOARD_FILE = "auto-dashboard.txt";
 
 export interface AutoFlags {
   /** 1-based wallet index, or "all". */
@@ -294,11 +299,73 @@ async function printCooldownDashboard(
     };
   });
 
+  // Inline view: limit to N rows so a 100-wallet setup doesn't fill
+  // the terminal scrollback. The full table is always written to
+  // ./auto-dashboard.txt below so the user can `less` it freely.
+  //   AUTO_DASHBOARD_LIMIT = positive integer (default 10)
+  //                        | "all" / "0" → print every row inline
+  const limit = resolveDashboardLimit(env.AUTO_DASHBOARD_LIMIT);
+  const inlineRows = limit === "all" || rows.length <= limit ? rows : rows.slice(0, limit);
+  const hidden = rows.length - inlineRows.length;
+  const dashboardPath = resolve(process.cwd(), DASHBOARD_FILE);
+
+  const all = aggregateActivity(rows);
+
   console.log(`\nDashboard — balances now (ETH), activity counters cumulative across runs:`);
-  console.log(renderAutoDashboard(rows));
-  const grandTotal = totalTePoints(rows);
-  console.log(`  Grand total TePoints: ${grandTotal.toLocaleString("en-US")} (${POINTS_PER_TX.toLocaleString("en-US")} per send/recv/bridge tx)`);
-  console.log(`  Saved to ${statsStorePath()} (delete the file to reset).`);
+  console.log(renderAutoDashboard(inlineRows));
+  if (hidden > 0) {
+    const shown = aggregateActivity(inlineRows);
+    const more = aggregateActivity(rows.slice(inlineRows.length));
+    console.log(
+      `  + ${hidden} more wallet${hidden === 1 ? "" : "s"} ` +
+      `(send=${more.send.toLocaleString("en-US")}, ` +
+      `recv=${more.recv.toLocaleString("en-US")}, ` +
+      `bridge=${more.bridge.toLocaleString("en-US")}, ` +
+      `TePoints=${more.tepoints.toLocaleString("en-US")}). ` +
+      `Top ${shown.walletCount} above; full table at ${dashboardPath}.`,
+    );
+  }
+  console.log(
+    `  Grand total: send=${all.send.toLocaleString("en-US")}, ` +
+    `recv=${all.recv.toLocaleString("en-US")}, ` +
+    `bridge=${all.bridge.toLocaleString("en-US")}, ` +
+    `TePoints=${all.tepoints.toLocaleString("en-US")} ` +
+    `(${POINTS_PER_TX.toLocaleString("en-US")} per send/recv/bridge tx).`,
+  );
+  console.log(`  Stats persisted to ${statsStorePath()} (delete the file to reset).`);
+
+  // Always write the full table to disk so the user can scroll through
+  // it with `less`/`tail -f` without filling the terminal.
+  try {
+    writeFileSync(
+      dashboardPath,
+      [
+        `# TeQoin Bot — auto-loop dashboard`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Wallets:   ${rows.length}`,
+        `# Grand:     send=${all.send.toLocaleString("en-US")}, recv=${all.recv.toLocaleString("en-US")}, bridge=${all.bridge.toLocaleString("en-US")}, TePoints=${all.tepoints.toLocaleString("en-US")}`,
+        ``,
+        renderAutoDashboard(rows),
+        ``,
+      ].join("\n"),
+      "utf8",
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`  (could not write ${dashboardPath}: ${message})`);
+  }
+}
+
+function resolveDashboardLimit(raw: string | undefined): number | "all" {
+  const v = raw?.trim().toLowerCase();
+  if (!v) return DEFAULT_DASHBOARD_LIMIT;
+  if (v === "all" || v === "0") return "all";
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 10000) {
+    console.warn(`[dashboard] AUTO_DASHBOARD_LIMIT="${raw}" invalid; using default ${DEFAULT_DASHBOARD_LIMIT}.`);
+    return DEFAULT_DASHBOARD_LIMIT;
+  }
+  return n;
 }
 
 async function gatherConfig(flags: AutoFlags, env: NodeJS.ProcessEnv): Promise<AutoConfig> {

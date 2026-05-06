@@ -42,12 +42,21 @@ Commands (callable directly):
   help        Show this help.
 
 Transfer flags:
+  --chain <slug>        "tequoin" (default) or "sepolia"   (else interactive)
+                        - tequoin: recipients auto-fetched from the TeQoin
+                          block explorer; main wallet tops up workers first.
+                        - sepolia: recipients = generated workers below
+                          MAIN_TOPUP_THRESHOLD on Sepolia. Main wallet only
+                          (or use --to). Useful as a fast top-up alternative
+                          to bridge --direction deposit.
   --wallet <n|all>      1-based wallet index or "all"      (else interactive)
   --count <N>           transactions per wallet            (else interactive, default 1)
+                        On Sepolia, capped at the top-up queue size when
+                        running from main wallet without --to.
   --amount <eth>        amount per tx in ETH               (else interactive)
   --random-min <eth>    randomize amount per tx, lower bound (use with --random-max)
   --random-max <eth>    randomize amount per tx, upper bound (use with --random-min)
-  --to <addr>           send everything to a fixed addr    (else auto from explorer)
+  --to <addr>           send everything to a fixed addr    (else auto)
   --yes                 skip the confirmation prompt
 
 Bridge flags:
@@ -73,6 +82,10 @@ Auto-24h env overrides:
   AUTO_BRIDGE_AMOUNT_MIN    default 0.0001
   AUTO_BRIDGE_AMOUNT_MAX    default 0.0013
   AUTO_COOLDOWN_HOURS       default 24
+  AUTO_DASHBOARD_LIMIT      max wallets in inline cooldown table (default 10;
+                            set to "all" / "0" to print every wallet inline).
+                            The full table is always written to
+                            ./auto-dashboard.txt regardless.
 
 Create Account flags:
   --count <N>           number of new wallets to generate (else interactive)
@@ -106,6 +119,7 @@ Examples:
   pnpm start balance
   pnpm start transfer --wallet all --count 3 --amount 0.0001 --yes
   pnpm start transfer --wallet 1 --count 5 --random-min 0.0001 --random-max 0.0013 --yes
+  pnpm start transfer --chain sepolia --wallet 1 --count 50 --amount 0.0012 --yes
   pnpm start bridge --direction deposit  --wallet 1 --count 2 --amount 0.01  --yes
   pnpm start bridge --direction withdraw --wallet 1 --count 1 --amount 0.001 --yes
   pnpm start auto    --wallet all --transfers 10 --bridges 1 --bridge-mode both --yes
@@ -135,6 +149,7 @@ async function main(): Promise<void> {
         to: flagString(flags, "to"),
         amount: flagString(flags, "amount"),
         count: flagString(flags, "count"),
+        chain: flagString(flags, "chain"),
         randomMin: flagString(flags, "random-min"),
         randomMax: flagString(flags, "random-max"),
         yes: flagBool(flags, "yes") || flagBool(flags, "y"),

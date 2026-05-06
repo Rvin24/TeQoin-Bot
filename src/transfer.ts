@@ -1,29 +1,29 @@
 /**
- * Transfer command — send native ETH on **TeQoin L2** from one or more
- * wallets, looping `count` transactions per wallet.
+ * Transfer command — send native ETH on **TeQoin L2** or **Ethereum
+ * Sepolia** from one or more wallets, looping `count` transactions per
+ * wallet.
  *
- * Recipients are picked automatically from the TeQoin block explorer's
- * recent-transactions feed (api.teqoin.io). The user can still override
- * with `--to <addr>` to send everything to a fixed recipient instead.
+ * Recipient sourcing depends on the chain:
  *
- * Top-up priority for the main account:
- *   When the sending wallet has role="main" (the first env/file key)
- *   AND we're picking recipients automatically (no --to), the bot first
- *   tops up any generated wallets whose balance is below
- *   `MAIN_TOPUP_THRESHOLD` (default 0.005 ETH). Once those slots are
- *   filled, remaining slots fall back to random explorer addresses.
- *   This gives the funded wallet a useful job (funding workers) before
- *   it starts sending to strangers.
+ *   TeQoin L2  : recipients picked automatically from the TeQoin block
+ *                explorer's recent-transactions feed (api.teqoin.io).
+ *                When the sending wallet has role="main" the bot first
+ *                tops up any generated wallets whose TeQoin balance is
+ *                below `MAIN_TOPUP_THRESHOLD` (default 0.005 ETH);
+ *                remaining slots fall back to random explorer addresses.
  *
- * Flow:
- *   1. Pick which wallet(s) to use (or all).
- *   2. Ask how many transactions per wallet (default 1).
- *   3. Ask the per-tx amount.
- *   4. Build a recipient pool from the explorer (excluding the user's
- *      own wallets and the zero address). Independently, query the
- *      balance of every generated wallet so we know which ones the
- *      main account should top up first.
- *   5. Show summary, ask for confirmation, then broadcast.
+ *   Sepolia    : there is no public indexer for the testnet recipient
+ *                pool the way TeQoin has, so the only auto-recipient
+ *                source is the worker top-up queue — the main wallet
+ *                funds generated wallets whose Sepolia balance is below
+ *                `MAIN_TOPUP_THRESHOLD`. This is intended as a faster
+ *                substitute for `bridge --direction deposit` when you
+ *                just want to push Sepolia ETH to your workers without
+ *                waiting for the bridge to finalize. Non-main wallets
+ *                must use `--to <addr>` on Sepolia (no explorer fallback).
+ *
+ * Either chain accepts `--to <addr>` to bypass auto-recipient logic and
+ * send everything to a single fixed address.
  *
  * Per-wallet balance pre-flight: we sum (count × amount + estimated fee
  * headroom) and skip a wallet if it can't cover the batch. Failures on
@@ -34,7 +34,7 @@ import { formatEther, parseEther, type TransactionRequest } from "ethers";
 import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
 import { type LoadedWallet, shortAddress, loadWallets, summarizeWalletSources } from "./wallet.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
-import { pickWallets, askAmount, askCount, confirm } from "./prompt.js";
+import { pickWallets, askAmount, askCount, askTransferChain, confirm } from "./prompt.js";
 import { fetchAddressPool, sampleRecipients } from "./explorer.js";
 import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 
@@ -51,6 +51,12 @@ export interface TransferFlags {
   count?: string;
   /** Skip the confirmation prompt. */
   yes?: boolean;
+  /**
+   * Chain slug: "tequoin" (default) or "sepolia". On Sepolia the
+   * recipient source is the worker top-up queue only — there is no
+   * explorer-recipient fallback for that chain.
+   */
+  chain?: string;
   /**
    * If both are set, ignore `amount` and pick a fresh random amount in
    * `[randomMin, randomMax]` (inclusive) for every individual tx. Used
@@ -84,18 +90,31 @@ export interface TransferRunStats {
   receivesByAddress: Record<string, number>;
 }
 
-const TRANSFER_CHAIN: ChainProfile = (() => {
-  const c = getChainBySlug("tequoin");
-  if (!c) throw new Error("TeQoin L2 chain config missing.");
+const SUPPORTED_TRANSFER_CHAINS = ["tequoin", "sepolia"] as const;
+type TransferChainSlug = (typeof SUPPORTED_TRANSFER_CHAINS)[number];
+
+function resolveTransferChain(slug: string | undefined): ChainProfile {
+  const wanted = (slug ?? "tequoin").trim().toLowerCase();
+  if (!SUPPORTED_TRANSFER_CHAINS.includes(wanted as TransferChainSlug)) {
+    throw new Error(
+      `Invalid --chain="${slug}". Supported transfer chains: ${SUPPORTED_TRANSFER_CHAINS.join(", ")}.`,
+    );
+  }
+  const c = getChainBySlug(wanted);
+  if (!c) throw new Error(`Chain "${wanted}" config missing.`);
   return c;
-})();
+}
 
 export async function runTransfer(
   flags: TransferFlags = {},
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<TransferRunStats> {
   const stats: TransferRunStats = { sendsByAddress: {}, receivesByAddress: {} };
-  const chain = TRANSFER_CHAIN;
+  // Resolve chain. CLI flag wins; otherwise interactive picker (TeQoin
+  // default in non-TTY). Sepolia switches to top-up-only recipient mode.
+  const chainSlug = flags.chain?.trim() ? flags.chain : await askTransferChain();
+  const chain = resolveTransferChain(chainSlug);
+  const useExplorer = chain.slug === "tequoin";
   const provider = buildProvider(chain, env);
 
   try {
@@ -106,7 +125,7 @@ export async function runTransfer(
     console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} (${summarizeWalletSources(wallets)}).\n`);
 
     const selected = await pickWallets(wallets, flags.wallet);
-    const count = flags.count
+    let count = flags.count
       ? parsePositiveInt(flags.count, "count")
       : await askCount("How many transactions per wallet?", 1);
 
@@ -123,7 +142,6 @@ export async function runTransfer(
     const fixedValue = fixedAmount ? parseEther(fixedAmount) : undefined;
 
     // Build recipient list.
-    const totalRecipientsNeeded = count * selected.length;
     const fixedRecipient = (flags.to ?? "").trim();
     let recipientPool: string[] = [];
     let topupQueue: string[] = [];
@@ -132,12 +150,17 @@ export async function runTransfer(
       validateAddress(fixedRecipient);
       console.log(`Recipient (fixed): ${fixedRecipient}`);
     } else {
-      console.log(`Fetching recipient pool from ${chain.name} explorer…`);
-      const exclude = wallets.map((w) => w.address);
-      recipientPool = await fetchAddressPool(exclude, { env });
-      console.log(`  pool size: ${recipientPool.length} EOA address${recipientPool.length === 1 ? "" : "es"} (excluding your ${wallets.length} wallet${wallets.length === 1 ? "" : "s"}).`);
-      if (recipientPool.length === 0) {
-        throw new Error("Recipient pool is empty. Pass --to <addr> to use a fixed recipient instead.");
+      // Recipient sourcing differs per chain: TeQoin uses the explorer
+      // pool (with the main-wallet top-up queue layered on top); Sepolia
+      // has no equivalent indexer so it uses ONLY the top-up queue.
+      if (useExplorer) {
+        console.log(`Fetching recipient pool from ${chain.name} explorer…`);
+        const exclude = wallets.map((w) => w.address);
+        recipientPool = await fetchAddressPool(exclude, { env });
+        console.log(`  pool size: ${recipientPool.length} EOA address${recipientPool.length === 1 ? "" : "es"} (excluding your ${wallets.length} wallet${wallets.length === 1 ? "" : "s"}).`);
+        if (recipientPool.length === 0) {
+          throw new Error("Recipient pool is empty. Pass --to <addr> to use a fixed recipient instead.");
+        }
       }
 
       // Top-up priority queue for the main wallet. Only build it if the
@@ -148,7 +171,7 @@ export async function runTransfer(
       if (mainSelected && generatedWallets.length > 0) {
         topupThresholdEth = (env.MAIN_TOPUP_THRESHOLD ?? DEFAULT_TOPUP_THRESHOLD_ETH).trim();
         const threshold = parseEther(validateAmount(topupThresholdEth));
-        console.log(`  checking balance of ${generatedWallets.length} generated wallet${generatedWallets.length === 1 ? "" : "s"} for top-up priority (threshold ${topupThresholdEth} ${chain.symbol})…`);
+        console.log(`  checking balance of ${generatedWallets.length} generated wallet${generatedWallets.length === 1 ? "" : "s"} on ${chain.name} for top-up priority (threshold ${topupThresholdEth} ${chain.symbol})…`);
         const generatedBalances = await Promise.all(
           generatedWallets.map((w) => provider.getBalance(w.address)),
         );
@@ -160,7 +183,35 @@ export async function runTransfer(
         topupQueue = lowGenerated.map(([w]) => w.address.toLowerCase());
         console.log(`  top-up priority: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold.`);
       }
+
+      // On Sepolia (no explorer fallback) every selected wallet must
+      // have a recipient source. Hard-fail before broadcast rather than
+      // silently using an empty pool.
+      if (!useExplorer) {
+        const nonMainSelected = selected.filter((w) => w.role !== "main");
+        if (nonMainSelected.length > 0) {
+          throw new Error(
+            `Sepolia transfer with auto-recipient is only supported for the main wallet. ` +
+            `Non-main wallets in the selection (#${nonMainSelected.map((w) => w.index).join(", #")}) need --to <addr>.`,
+          );
+        }
+        const mainSelected = selected.find((w) => w.role === "main");
+        if (mainSelected && topupQueue.length === 0) {
+          throw new Error(
+            `Sepolia transfer: no generated worker wallets are below the top-up threshold (${topupThresholdEth || DEFAULT_TOPUP_THRESHOLD_ETH} ${chain.symbol}). ` +
+            `Either lower MAIN_TOPUP_THRESHOLD, generate more workers (\`pnpm start create\`), or pass --to <addr> to send to a fixed address.`,
+          );
+        }
+        // No explorer fallback on Sepolia, so cap `count` at the
+        // queue size so we never run out of recipients mid-batch.
+        if (mainSelected && count > topupQueue.length) {
+          console.log(`  ⚠ count=${count} exceeds top-up queue size (${topupQueue.length}). Capping at ${topupQueue.length}.`);
+          count = topupQueue.length;
+        }
+      }
     }
+
+    const totalRecipientsNeeded = count * selected.length;
 
     // Summary.
     const amountLabel = randomRange
@@ -168,9 +219,11 @@ export async function runTransfer(
       : `${fixedAmount} ${chain.symbol}`;
     const recipientsLabel = fixedRecipient
       ? "fixed (--to)"
-      : topupQueue.length > 0
-        ? `auto from explorer (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} first)`
-        : "auto from explorer";
+      : useExplorer
+        ? topupQueue.length > 0
+          ? `auto from explorer (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} first)`
+          : "auto from explorer"
+        : `top-up queue: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold (poorest first; no explorer fallback on ${chain.name})`;
     console.log(`\nTransfer summary:`);
     console.log(`  Chain        : ${chain.name} (chainId ${chain.chainId})`);
     console.log(`  Wallets      : ${selected.length}`);
@@ -359,7 +412,14 @@ function buildRecipientsForWallet(args: {
     }
   }
   if (out.length < count) {
-    const fill = sampleRecipients(recipientPool, count - out.length);
+    const remaining = count - out.length;
+    if (recipientPool.length === 0) {
+      throw new Error(
+        `Cannot build recipient list: top-up queue exhausted after ${out.length} slot(s) ` +
+        `and no explorer pool available. Lower the requested tx count or pass --to <addr>.`,
+      );
+    }
+    const fill = sampleRecipients(recipientPool, remaining);
     out.push(...fill);
   }
   return out;

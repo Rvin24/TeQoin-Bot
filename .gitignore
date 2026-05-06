@@ -9,3 +9,4 @@ build/
 wallets.txt
 generated-wallets.json
 auto-stats.json
+auto-dashboard.txt
