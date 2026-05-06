@@ -49,7 +49,9 @@ Shows the native ETH balance of every loaded wallet on **both** TeQoin L2 and Se
 
 ### 2. Transfer
 
-Native ETH send on **TeQoin L2** only. The flow:
+Native ETH send on **TeQoin L2** or **Ethereum Sepolia** (pick at the start of the flow, or pass `--chain tequoin|sepolia`). Recipient sourcing differs between the two:
+
+#### Transfer on TeQoin L2 (`--chain tequoin`, default)
 
 1. Pick which wallet(s) to use — single index or `all`.
 2. **How many transactions per wallet?** (default 1)
@@ -62,6 +64,19 @@ Native ETH send on **TeQoin L2** only. The flow:
 5. Pre-flight balance check (skips a wallet if it can't cover `count × amount`).
 6. Confirmation prompt (skip with `--yes`).
 7. Per-tx broadcast with explorer link and status.
+
+#### Transfer on Ethereum Sepolia (`--chain sepolia`)
+
+Sepolia has no public indexer that the bot can use to source random recipient addresses, so the only auto-recipient source is the **worker top-up queue**. This mode is intended as a fast alternative to `bridge --direction deposit` when you just want to push Sepolia ETH to your generated wallets without waiting for the bridge to finalize.
+
+Rules:
+
+- Only the main wallet (`PRIVATE_KEYS[0]`) is allowed without `--to` — non-main wallets must pass `--to <addr>` explicitly.
+- Recipients are the generated wallets whose Sepolia balance is below `MAIN_TOPUP_THRESHOLD` (default 0.005 ETH), poorest first.
+- If `count` exceeds the queue size, it is automatically capped at the queue size with a warning. (No explorer fallback.)
+- If the queue is empty (e.g. all workers already funded), the command aborts with a clear error rather than silently doing nothing or hitting random addresses.
+
+Example: `pnpm start transfer --chain sepolia --wallet 1 --count 50 --amount 0.0012 --yes` will pick up to 50 worker wallets that are currently below threshold and top each one up with 0.0012 Sepolia ETH.
 
 ### 3. Bridge
 
@@ -103,7 +118,7 @@ Ctrl+C at any point exits cleanly. Wallets that can't cover the per-cycle batch 
 
 Amount range and cooldown are configurable via env (`AUTO_TRANSFER_AMOUNT_MIN`/`MAX`, `AUTO_BRIDGE_AMOUNT_MIN`/`MAX`, `AUTO_COOLDOWN_HOURS`) — useful for smoke-testing the loop without waiting a full day, or for tweaking the spending profile without changing code.
 
-#### Cooldown dashboard & TePoints
+#### Cooldown dashboard & TePoints (with row limit)
 
 At the start of every cooldown the bot prints a per-wallet table:
 
@@ -122,6 +137,7 @@ Dashboard — balances now (ETH), activity counters cumulative across runs:
   - `Recv` = transfers received on TeQoin L2 + deposit-bridge credits (deposit recipient on L2). Credited at broadcast time.
   - `Bridge` = bridges initiated by this wallet (deposit + withdraw). Withdrawals are **not** double-counted as a TeQoin send.
 - Counters are **cumulative across cycles and across restarts** — they live in `./auto-stats.json` (see below).
+- For setups with many wallets (50, 100, 200) the inline view truncates to the first **N rows** so it doesn't fill the terminal. The default is **10**, configurable via `AUTO_DASHBOARD_LIMIT` (positive integer, or `"all"` / `"0"` to print every row inline). The full table is always written to `./auto-dashboard.txt` (gitignored, overwritten each cycle) so you can read every wallet with `less auto-dashboard.txt` or `tail -f auto-dashboard.txt` from another terminal.
 
 #### Persistence: `auto-stats.json`
 
@@ -305,6 +321,7 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `AUTO_TRANSFER_AMOUNT_MIN` / `_MAX` | no | Random amount range used by `auto` for transfers (defaults `0.0001` / `0.0013`). |
 | `AUTO_BRIDGE_AMOUNT_MIN`   / `_MAX` | no | Random amount range used by `auto` for bridges (defaults `0.0001` / `0.0013`). |
 | `AUTO_COOLDOWN_HOURS`              | no | Sleep duration between auto cycles (default `24`). Fractional values OK for testing. |
+| `AUTO_DASHBOARD_LIMIT`             | no | Max wallets shown inline in the auto cooldown dashboard (default `10`). Set to `all` or `0` to print every row inline. The full table is always written to `./auto-dashboard.txt` regardless. |
 | `MAIN_TOPUP_THRESHOLD`             | no | Threshold (in ETH) below which a generated wallet is prioritized as a recipient when the main account runs `transfer`, `bridge`, or `auto` without an explicit `--to`. For `bridge`, the threshold is checked against the *destination* chain's balance. Default `0.005`. Set to `0` to disable. |
 
 \*Or use `wallets.txt`.

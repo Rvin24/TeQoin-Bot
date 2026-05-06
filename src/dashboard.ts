@@ -148,3 +148,34 @@ export function renderAutoDashboard(rows: readonly AutoDashboardRow[]): string {
 export function totalTePoints(rows: readonly AutoDashboardRow[]): number {
   return rows.reduce((sum, r) => sum + (r.send + r.recv + r.bridge) * POINTS_PER_TX, 0);
 }
+
+export interface DashboardAggregate {
+  walletCount: number;
+  send: number;
+  recv: number;
+  bridge: number;
+  tepoints: number;
+}
+
+/**
+ * Sum the activity counters across a set of rows. Used for the
+ * footer line under a truncated inline dashboard so the user can
+ * still see the totals without scrolling through every wallet.
+ */
+export function aggregateActivity(rows: readonly AutoDashboardRow[]): DashboardAggregate {
+  let send = 0;
+  let recv = 0;
+  let bridge = 0;
+  for (const r of rows) {
+    send += r.send;
+    recv += r.recv;
+    bridge += r.bridge;
+  }
+  return {
+    walletCount: rows.length,
+    send,
+    recv,
+    bridge,
+    tepoints: (send + recv + bridge) * POINTS_PER_TX,
+  };
+}
