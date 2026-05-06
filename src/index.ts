@@ -93,6 +93,14 @@ Main account top-up:
 
   Setting --to forces a single recipient and disables this priority.
 
+Auto-24h dashboard & TePoints:
+  At the start of every cooldown the auto loop refreshes per-wallet
+  balances on both chains and prints a table including TeQoin Mini App
+  reward points (1,000 per Send / Recv / Bridge tx on TeQoin L2). The
+  counters are persisted to ./auto-stats.json after every cycle so they
+  survive a restart of the bot. Delete that file to reset them; manual
+  transfer / bridge runs do NOT touch it.
+
 Examples:
   pnpm start
   pnpm start balance

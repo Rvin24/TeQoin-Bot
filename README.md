@@ -33,7 +33,19 @@ What do you want to do?
 
 ### 1. Check Balance
 
-Shows the native ETH balance of every loaded wallet on **both** TeQoin L2 and Sepolia, with explorer links and a per-chain total. One chain failing (e.g. RPC down) does not stop the other.
+Shows the native ETH balance of every loaded wallet on **both** TeQoin L2 and Sepolia in a single compact table. One chain failing (e.g. RPC down) does not stop the other — the offending column shows `err` and the rest of the table still renders.
+
+```
+  TeQoin L2 (chainId 420377)  (block 1491443)
+  Ethereum Sepolia (chainId 11155111)  (block 10798674)
+
+┌─────┬───────────────┬────────────────┬────────────────┐
+│   # │ Wallet        │   TeQoin (ETH) │  Sepolia (ETH) │
+├─────┼───────────────┼────────────────┼────────────────┤
+│   1 │ 0xbC01…847B   │       0.046123 │         0.7873 │
+│   2 │ 0x0539…0a31   │        0.00012 │              0 │
+…
+```
 
 ### 2. Transfer
 
@@ -83,13 +95,51 @@ Every cycle the bot then:
 
 1. Sends N transfers per wallet on TeQoin L2 (random recipient from explorer, **random amount** between `0.0001`–`0.0013` ETH per tx).
 2. Sends M bridges per wallet (same random-amount range, direction(s) per the chosen mode).
-3. Logs a per-cycle summary.
+3. Refreshes balances on both chains and prints a **cooldown dashboard** (see below).
 4. Sleeps **24h**, with a status update every hour so you know the loop is alive.
 5. Wakes up and starts cycle N+1 with the **same** parameters — no re-prompting.
 
 Ctrl+C at any point exits cleanly. Wallets that can't cover the per-cycle batch are skipped for that phase only — they'll be re-checked next cycle.
 
 Amount range and cooldown are configurable via env (`AUTO_TRANSFER_AMOUNT_MIN`/`MAX`, `AUTO_BRIDGE_AMOUNT_MIN`/`MAX`, `AUTO_COOLDOWN_HOURS`) — useful for smoke-testing the loop without waiting a full day, or for tweaking the spending profile without changing code.
+
+#### Cooldown dashboard & TePoints
+
+At the start of every cooldown the bot prints a per-wallet table:
+
+```
+Dashboard — balances now (ETH), activity counters cumulative across runs:
+┌─────┬───────────────┬──────────────┬──────────────┬────────┬────────┬────────┬────────────┐
+│   # │ Wallet        │       TeQoin │      Sepolia │   Send │   Recv │ Bridge │   TePoints │
+├─────┼───────────────┼──────────────┼──────────────┼────────┼────────┼────────┼────────────┤
+│   1 │ 0xbC01…847B   │     0.046123 │       0.7873 │     50 │      0 │     50 │    100,000 │
+…
+```
+
+- `Send`, `Recv`, `Bridge` are tx counts.
+- `TePoints` mirrors the **TeQoin Mini App** (`Telegram`) reward formula: **1,000 points per `Send` / `Recv` / `Bridge` tx on TeQoin L2**. The bot does **not** fetch from the mini-app — it derives points from the local activity log, which is the same indicator the mini-app uses.
+  - `Send` = transfers initiated by this wallet on TeQoin L2.
+  - `Recv` = transfers received on TeQoin L2 + deposit-bridge credits (deposit recipient on L2). Credited at broadcast time.
+  - `Bridge` = bridges initiated by this wallet (deposit + withdraw). Withdrawals are **not** double-counted as a TeQoin send.
+- Counters are **cumulative across cycles and across restarts** — they live in `./auto-stats.json` (see below).
+
+#### Persistence: `auto-stats.json`
+
+The auto loop persists per-wallet activity counters to `./auto-stats.json` after every cycle (gitignored, same pattern as `generated-wallets.json`). Schema:
+
+```json
+{
+  "version": 1,
+  "lastUpdated": "2026-05-06T03:00:00.000Z",
+  "totals": {
+    "0x...": { "send": 50, "recv": 0, "bridge": 50 }
+  }
+}
+```
+
+- The file is **loaded at the start** of every `pnpm start auto` run, so TePoints carry over after a Ctrl+C / restart.
+- Manual `transfer` / `bridge` runs **do not** write to this file — only the auto loop does.
+- **To reset** the counters, simply delete the file. The auto loop will re-create it after the first cycle.
 
 ### 5. Create Account
 
@@ -287,6 +337,8 @@ src/
   create.ts     # create-account command (generate worker wallets)
   accounts.ts   # generated-wallet store (read/write generated-wallets.json)
   random.ts     # random-amount picker shared by transfer / bridge / auto
+  dashboard.ts  # compact ASCII table renderers (balance + auto cooldown) + TePoints math
+  statsStore.ts # persistent per-address activity counters (auto-stats.json)
   index.ts      # CLI entry point + main-menu dispatcher
 ```
 
@@ -304,6 +356,7 @@ src/
 - [x] **Bridge Sepolia ↔ TeQoin L2** (deposit + withdraw, native ETH)
 - [x] **Auto 24h** loop with randomized per-tx amounts
 - [x] **Create worker wallets** + main-account top-up priority
+- [x] **Compact balance dashboard** + auto-cooldown dashboard with TeQoin Mini App `TePoints` (persisted to `auto-stats.json`)
 - [ ] Bridge status polling (read `bridge-history` and watch for L1 finalization / claim window)
 - [ ] ERC-20 transfer + ERC-20 bridge (the bridge contract supports it; this only ships native ETH today)
 - [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)

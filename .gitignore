@@ -8,3 +8,4 @@ build/
 .tsbuildinfo
 wallets.txt
 generated-wallets.json
+auto-stats.json

@@ -81,6 +81,31 @@ export interface BridgeFlags {
 
 export type BridgeDirection = "deposit" | "withdraw";
 
+/**
+ * Per-address counters accumulated over a single `runBridge` call.
+ *
+ * Keys are lowercased addresses. Counters only include *successfully
+ * broadcast* tx; skipped or failed tx do not contribute.
+ *
+ *   bridgesByAddress
+ *     - Incremented once per successful bridge tx initiated by that
+ *       address (deposit and withdraw both count).
+ *
+ *   depositReceivesByAddress
+ *     - Only populated for direction === "deposit". Incremented once
+ *       per successful deposit tx whose destination-chain recipient is
+ *       that address. Credited at broadcast time (not after L1
+ *       finalization) so the auto-24h dashboard's TePoints reflect the
+ *       same activity model the TeQoin Mini App exposes ("each
+ *       receive"). For withdrawals we do NOT credit a Sepolia receive
+ *       here because the L1 mini-app only awards points for activity on
+ *       TeQoin L2.
+ */
+export interface BridgeRunStats {
+  bridgesByAddress: Record<string, number>;
+  depositReceivesByAddress: Record<string, number>;
+}
+
 interface BridgeRoute {
   direction: BridgeDirection;
   source: ChainProfile;
@@ -114,7 +139,11 @@ const BRIDGE_ROUTES: Record<BridgeDirection, BridgeRoute> = {
   },
 };
 
-export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function runBridge(
+  flags: BridgeFlags = {},
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<BridgeRunStats> {
+  const stats: BridgeRunStats = { bridgesByAddress: {}, depositReceivesByAddress: {} };
   const direction = await resolveDirection(flags.direction);
   const route = BRIDGE_ROUTES[direction];
   const provider = buildProvider(route.source, env);
@@ -223,7 +252,7 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
       : await confirm(`\nBroadcast ${totalBridges} bridge transaction${totalBridges === 1 ? "" : "s"}?`, false);
     if (!proceed) {
       console.log("Aborted (no transactions broadcast).");
-      return;
+      return stats;
     }
 
     let sentCount = 0;
@@ -261,6 +290,13 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
           const receipt = await tx.wait(1);
           const status = receipt?.status === 1 ? "confirmed" : `mined (status ${receipt?.status ?? "?"})`;
           console.log(`        ${status} in block ${receipt?.blockNumber ?? "?"}`);
+          const senderKey = wallet.address.toLowerCase();
+          stats.bridgesByAddress[senderKey] = (stats.bridgesByAddress[senderKey] ?? 0) + 1;
+          if (route.direction === "deposit") {
+            const recipientKey = recipient.toLowerCase();
+            stats.depositReceivesByAddress[recipientKey] =
+              (stats.depositReceivesByAddress[recipientKey] ?? 0) + 1;
+          }
           sentCount++;
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
@@ -276,6 +312,7 @@ export async function runBridge(flags: BridgeFlags = {}, env: NodeJS.ProcessEnv 
       }
     }
     console.log(`\nDone. ${sentCount} sent, ${skippedCount} skipped, ${failedCount} failed.`);
+    return stats;
   } finally {
     provider.destroy();
     if (destProvider) destProvider.destroy();
