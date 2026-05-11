@@ -217,6 +217,7 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
   console.log(`\n--- Phase 1/2: ${config.transfersPerWallet} transfer(s) per wallet ---`);
   try {
     const phase1 = await runTransfer({
+      chain: "tequoin",
       wallet: config.walletSelector,
       count: String(config.transfersPerWallet),
       randomMin: config.transferRange.min,
