@@ -115,6 +115,18 @@ Auto-adjust per-tx amounts (random-range mode only):
       AUTO_PRECYCLE_TOPUP         "on" (default) or "off"
       AUTO_PRECYCLE_TOPUP_TARGET  default 2 * MAIN_TOPUP_THRESHOLD
 
+  Farm-main mode (auto-24h only, default "on"):
+    Only the main wallet earns TePoints in the TeQoin Mini App (1 wallet
+    per Telegram account on the backend). To make worker activity count
+    toward main's points, each auto cycle:
+      - workers send all TeQoin transfers to the main address (no
+        explorer pool) — each landing tx = "Receive" credit on main
+      - only the main wallet runs the bridge phase (workers skip)
+    Cooldown dashboard's TePoints column reflects main wallet only;
+    worker rows still show Send/Recv/Bridge counts for diagnostics.
+
+      AUTO_FARM_MAIN              "on" (default) or "off"
+
   Fixed-amount mode (--amount, no random range) skips auto-scaling and
   uses the legacy "skip if balance < count * amount" pre-flight.
 

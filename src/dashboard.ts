@@ -44,6 +44,17 @@ export interface AutoDashboardRow extends BalanceDashboardRow {
   recv: number;
   /** Bridge transactions initiated by this wallet (deposit + withdraw). */
   bridge: number;
+  /**
+   * Whether this wallet actually earns TePoints in the TeQoin Mini App.
+   * The mini-app backend awards points per-Telegram-user, and the user
+   * can only register a single wallet (`SetUserNewWalletAddress`) — so
+   * in practice only the main wallet (from PRIVATE_KEYS / wallets.txt)
+   * is eligible. Generated workers do on-chain activity but never
+   * accrue TePoints unless they're swapped in via the mini-app.
+   *
+   * Defaults to `true` if omitted (back-compat with older callers).
+   */
+  tepointsEligible?: boolean;
 }
 
 interface Column {
@@ -117,6 +128,20 @@ export function renderBalanceDashboard(rows: readonly BalanceDashboardRow[]): st
   return renderTable(columns, body);
 }
 
+/**
+ * Whether a given row should accrue TePoints. We default to `true` if
+ * the consumer didn't set `tepointsEligible` (back-compat with older
+ * callers that don't know about the eligibility distinction).
+ */
+function isEligible(r: AutoDashboardRow): boolean {
+  return r.tepointsEligible !== false;
+}
+
+/** TePoints earned by a single row, accounting for eligibility. */
+function rowTePoints(r: AutoDashboardRow): number {
+  return isEligible(r) ? (r.send + r.recv + r.bridge) * POINTS_PER_TX : 0;
+}
+
 export function renderAutoDashboard(rows: readonly AutoDashboardRow[]): string {
   const columns: Column[] = [
     { header: "#", width: 3, align: "right" },
@@ -129,7 +154,6 @@ export function renderAutoDashboard(rows: readonly AutoDashboardRow[]): string {
     { header: "TePoints", width: 10, align: "right" },
   ];
   const body = rows.map((r) => {
-    const tepoints = (r.send + r.recv + r.bridge) * POINTS_PER_TX;
     return [
       String(r.index),
       shortAddr(r.address),
@@ -138,15 +162,15 @@ export function renderAutoDashboard(rows: readonly AutoDashboardRow[]): string {
       fmtInt(r.send),
       fmtInt(r.recv),
       fmtInt(r.bridge),
-      fmtInt(tepoints),
+      isEligible(r) ? fmtInt(rowTePoints(r)) : "—",
     ];
   });
   return renderTable(columns, body);
 }
 
-/** Total TePoints across a set of rows. */
+/** Total TePoints across a set of rows (eligibility-aware). */
 export function totalTePoints(rows: readonly AutoDashboardRow[]): number {
-  return rows.reduce((sum, r) => sum + (r.send + r.recv + r.bridge) * POINTS_PER_TX, 0);
+  return rows.reduce((sum, r) => sum + rowTePoints(r), 0);
 }
 
 export interface DashboardAggregate {
@@ -161,21 +185,28 @@ export interface DashboardAggregate {
  * Sum the activity counters across a set of rows. Used for the
  * footer line under a truncated inline dashboard so the user can
  * still see the totals without scrolling through every wallet.
+ *
+ * Send/Recv/Bridge counters sum across *all* rows so the user can
+ * see worker activity for diagnostic purposes. TePoints sums only
+ * rows that are TePoints-eligible (i.e. the registered main wallet);
+ * worker activity does not generate real TePoints in the mini app.
  */
 export function aggregateActivity(rows: readonly AutoDashboardRow[]): DashboardAggregate {
   let send = 0;
   let recv = 0;
   let bridge = 0;
+  let tepoints = 0;
   for (const r of rows) {
     send += r.send;
     recv += r.recv;
     bridge += r.bridge;
+    tepoints += rowTePoints(r);
   }
   return {
     walletCount: rows.length,
     send,
     recv,
     bridge,
-    tepoints: (send + recv + bridge) * POINTS_PER_TX,
+    tepoints,
   };
 }

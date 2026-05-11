@@ -81,7 +81,7 @@ const DEFAULT_COOLDOWN_HOURS = 24;
 
 export async function runAuto(flags: AutoFlags = {}, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const config = await gatherConfig(flags, env);
-  printConfigSummary(config);
+  printConfigSummary(config, env);
 
   if (!flags.yes) {
     const ok = await confirm(
@@ -213,8 +213,10 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
     console.log(`Pre-cycle top-up failed: ${message}. Continuing to phase 1.`);
   }
 
+  const farmMain = isFarmMainEnabled(env);
+
   // Phase 1: transfers (TeQoin L2)
-  console.log(`\n--- Phase 1/2: ${config.transfersPerWallet} transfer(s) per wallet ---`);
+  console.log(`\n--- Phase 1/2: ${config.transfersPerWallet} transfer(s) per wallet${farmMain ? " (farm-main: workers → main)" : ""} ---`);
   try {
     const phase1 = await runTransfer({
       chain: "tequoin",
@@ -223,6 +225,7 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
       randomMin: config.transferRange.min,
       randomMax: config.transferRange.max,
       yes: true,
+      farmMain,
     }, env);
     for (const [addr, n] of Object.entries(phase1.sendsByAddress)) {
       cycle.transfer.sendsByAddress[addr] = (cycle.transfer.sendsByAddress[addr] ?? 0) + n;
@@ -235,29 +238,92 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
     console.log(`Transfer phase failed: ${message}. Continuing to bridge phase.`);
   }
 
-  // Phase 2: bridges
-  const directions: ("deposit" | "withdraw")[] =
-    config.bridgeMode === "both"
-      ? ["deposit", "withdraw"]
-      : [config.bridgeMode];
-  for (const direction of directions) {
-    console.log(`\n--- Phase 2/2: ${config.bridgesPerWallet} ${direction} bridge(s) per wallet ---`);
-    try {
-      const bridgeStats = await runBridge({
-        direction,
-        wallet: config.walletSelector,
-        count: String(config.bridgesPerWallet),
-        randomMin: config.bridgeRange.min,
-        randomMax: config.bridgeRange.max,
-        yes: true,
-      }, env);
-      cycle.bridges.push(bridgeStats);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.log(`Bridge ${direction} phase failed: ${message}. Continuing.`);
+  // Phase 2: bridges.
+  //
+  // In farm-main mode, worker wallets earn no TePoints regardless of
+  // whether they bridge, so the bridge phase is narrowed to the main
+  // wallet only. If the user picked `--wallet 2` (a specific worker)
+  // we skip the bridge phase entirely.
+  const bridgeWalletSelector = await resolveBridgeWalletSelector(config, farmMain, env);
+  if (bridgeWalletSelector === null) {
+    console.log(`\n--- Phase 2/2: bridge phase SKIPPED (farm-main on; main wallet not in selection ${config.walletSelector}) ---`);
+  } else {
+    const directions: ("deposit" | "withdraw")[] =
+      config.bridgeMode === "both"
+        ? ["deposit", "withdraw"]
+        : [config.bridgeMode];
+    for (const direction of directions) {
+      const farmNote = farmMain && bridgeWalletSelector !== config.walletSelector
+        ? ` (farm-main: main wallet only)`
+        : farmMain
+          ? ` (farm-main on)`
+          : "";
+      console.log(`\n--- Phase 2/2: ${config.bridgesPerWallet} ${direction} bridge(s) per wallet${farmNote} ---`);
+      try {
+        const bridgeStats = await runBridge({
+          direction,
+          wallet: bridgeWalletSelector,
+          count: String(config.bridgesPerWallet),
+          randomMin: config.bridgeRange.min,
+          randomMax: config.bridgeRange.max,
+          yes: true,
+        }, env);
+        cycle.bridges.push(bridgeStats);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.log(`Bridge ${direction} phase failed: ${message}. Continuing.`);
+      }
     }
   }
   return cycle;
+}
+
+/**
+ * Farm-main mode: when on, worker wallets route their TeQoin transfers
+ * to the main wallet (so main wallet — the only one registered with
+ * the TeQoin Mini App — earns "Receive" credits) and the bridge phase
+ * runs only for the main wallet. Default: on.
+ *
+ * Toggle via `AUTO_FARM_MAIN=on|off` (case-insensitive).
+ */
+function isFarmMainEnabled(env: NodeJS.ProcessEnv): boolean {
+  const raw = (env.AUTO_FARM_MAIN ?? "on").trim().toLowerCase();
+  return raw !== "off" && raw !== "false" && raw !== "0";
+}
+
+/**
+ * Pick the wallet selector for the bridge phase. Without farm-main we
+ * use whatever the user picked at setup time. With farm-main on:
+ *
+ *   - "all"            → narrow to main's 1-based index.
+ *   - "<main index>"   → keep as-is (user already picked main).
+ *   - "<worker index>" → return null (bridge phase is skipped).
+ *
+ * Returns the resolved selector string, or `null` to indicate the
+ * bridge phase should be skipped this cycle.
+ */
+async function resolveBridgeWalletSelector(
+  config: AutoConfig,
+  farmMain: boolean,
+  env: NodeJS.ProcessEnv,
+): Promise<string | null> {
+  if (!farmMain) return config.walletSelector;
+  const tequoin = mustChain("tequoin");
+  const probe = buildProvider(tequoin, env);
+  try {
+    const wallets = loadWallets(probe, { env });
+    const main = wallets.find((w) => w.role === "main");
+    if (!main) {
+      // No main → keep original selector; runBridge will surface the
+      // missing-main error itself if relevant.
+      return config.walletSelector;
+    }
+    if (config.walletSelector === "all") return String(main.index);
+    if (config.walletSelector === String(main.index)) return config.walletSelector;
+    return null;
+  } finally {
+    probe.destroy();
+  }
 }
 
 /**
@@ -457,6 +523,11 @@ async function printCooldownDashboard(
       send: entry.send,
       recv: entry.recv,
       bridge: entry.bridge,
+      // Only the main wallet is registered with the TeQoin Mini App and
+      // therefore earns TePoints. Workers do on-chain activity (which
+      // is why we still show Send/Recv/Bridge counts for visibility)
+      // but the mini-app backend doesn't award them points.
+      tepointsEligible: w.role === "main",
     };
   });
 
@@ -491,7 +562,8 @@ async function printCooldownDashboard(
     `recv=${all.recv.toLocaleString("en-US")}, ` +
     `bridge=${all.bridge.toLocaleString("en-US")}, ` +
     `TePoints=${all.tepoints.toLocaleString("en-US")} ` +
-    `(${POINTS_PER_TX.toLocaleString("en-US")} per send/recv/bridge tx).`,
+    `(${POINTS_PER_TX.toLocaleString("en-US")} per send/recv/bridge tx; ` +
+    `main wallet only — workers not registered with mini app).`,
   );
   console.log(`  Stats persisted to ${statsStorePath()} (delete the file to reset).`);
 
@@ -583,16 +655,18 @@ async function gatherConfig(flags: AutoFlags, env: NodeJS.ProcessEnv): Promise<A
   };
 }
 
-function printConfigSummary(config: AutoConfig): void {
+function printConfigSummary(config: AutoConfig, env: NodeJS.ProcessEnv): void {
   const totalBridgesPerWalletPerCycle =
     config.bridgeMode === "both" ? config.bridgesPerWallet * 2 : config.bridgesPerWallet;
+  const farmMain = isFarmMainEnabled(env);
   console.log(`\nAuto-24h plan:`);
   console.log(`  Wallets       : ${config.walletSelector}`);
-  console.log(`  Transfers     : ${config.transfersPerWallet} tx/wallet/cycle  (TeQoin L2, auto-recipient)`);
+  console.log(`  Transfers     : ${config.transfersPerWallet} tx/wallet/cycle  (TeQoin L2${farmMain ? ", farm-main: workers → main" : ", auto-recipient"})`);
   console.log(`                  amount: random ${config.transferRange.min}–${config.transferRange.max} ETH per tx`);
-  console.log(`  Bridges       : ${totalBridgesPerWalletPerCycle} tx/wallet/cycle  (mode: ${config.bridgeMode})`);
+  console.log(`  Bridges       : ${totalBridgesPerWalletPerCycle} tx/wallet/cycle  (mode: ${config.bridgeMode}${farmMain ? "; farm-main: main wallet only" : ""})`);
   console.log(`                  amount: random ${config.bridgeRange.min}–${config.bridgeRange.max} ETH per tx`);
   console.log(`  Cooldown      : ${config.cooldownHours}h between cycles`);
+  console.log(`  Farm-main     : ${farmMain ? "on" : "off"}  (AUTO_FARM_MAIN; on by default — workers fund TePoints on main wallet)`);
   console.log(`  Loop forever  : yes (Ctrl+C to stop)`);
 }
 
