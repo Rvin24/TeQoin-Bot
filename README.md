@@ -169,6 +169,30 @@ If main runs out of balance for a particular top-up, that worker is skipped this
 
 TeQoin top-ups from Phase 0 **are** counted toward TePoints (Send for main, Recv for worker). Sepolia top-ups are NOT counted because Sepolia activity earns no TePoints in the TeQoin Mini App.
 
+#### Farm-main mode (default `on`)
+
+The TeQoin Mini App backend only awards points to the wallet currently registered with each Telegram account (`SetUserNewWalletAddress` — singular: 1 Telegram user ⇒ 1 active wallet). Generated worker wallets aren't linked to any Telegram account, so on-chain activity from them **does not earn real TePoints** in the mini app.
+
+To make worker activity translate into real points for the main wallet, the auto loop runs in **farm-main** mode by default. Per cycle, with `AUTO_FARM_MAIN=on`:
+
+- Every non-main wallet routes **all** its TeQoin transfers to the main wallet address (no explorer pool, no random recipients). Each landing tx counts as a "Receive" task on the mini app for the main wallet.
+- The bridge phase runs **only with the main wallet**. Workers never bridge in farm mode because bridge points only credit the registered wallet, and bridges are expensive (especially Sepolia deposits).
+- Phase 0 (pre-cycle worker top-up) still runs so workers always have enough native ETH to send to main.
+
+Resulting flow per cycle (with `--wallet all`, farm-main on):
+
+1. **Phase 0**: main → workers (top up on both chains) so workers have gas to participate.
+2. **Phase 1**: workers → main (each Send by a worker = Receive credit for main). Main also runs its own transfers in this phase using the regular top-up-queue + explorer logic.
+3. **Phase 2**: main does its bridges. Workers are skipped.
+
+To turn farm-main off and fall back to the old behavior (workers send to random explorer addresses; every selected wallet bridges), set `AUTO_FARM_MAIN=off`.
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `AUTO_FARM_MAIN` | `on` | Set to `off` to disable farm-main and restore the pre-PR-13 behavior. |
+
+The cooldown dashboard reflects this reality: it still shows `Send` / `Recv` / `Bridge` counts for every wallet (so you can verify workers are doing their on-chain activity), but the `TePoints` column is only computed for the main wallet — workers show `—`. Grand-total TePoints sums only main-wallet activity. Worker tx counts are kept for diagnostics; they aren't multiplied into TePoints because the mini-app backend wouldn't credit them anyway.
+
 #### Cooldown dashboard & TePoints (with row limit)
 
 At the start of every cooldown the bot prints a per-wallet table:
@@ -380,6 +404,7 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `SEPOLIA_BRIDGE_GAS_RESERVE`       | no | Per-tx fee headroom on Sepolia when auto-scaling random *deposit* amounts (default `0.0002`). |
 | `AUTO_PRECYCLE_TOPUP`              | no | `on` (default) or `off` — toggle the auto cycle's Phase 0 pre-cycle worker top-up. |
 | `AUTO_PRECYCLE_TOPUP_TARGET`       | no | Target balance (decimal ETH) for Phase 0 top-ups. Defaults to `2 × MAIN_TOPUP_THRESHOLD`. |
+| `AUTO_FARM_MAIN`                   | no | `on` (default) or `off` — when on, auto-loop workers send transfers to the main wallet (instead of random explorer addresses) and only the main wallet runs the bridge phase. See "Farm-main mode" above. |
 
 \*Or use `wallets.txt`.
 

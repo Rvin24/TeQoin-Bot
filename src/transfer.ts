@@ -81,6 +81,16 @@ export interface TransferFlags {
    */
   randomMin?: string;
   randomMax?: string;
+  /**
+   * Farm-main mode. When true, every non-main (worker) wallet routes
+   * all its outgoing transfers to the main wallet address — turning
+   * worker activity into "Receive" credits for the only wallet
+   * actually registered with the TeQoin Mini App. Has no effect on
+   * the main wallet's own transfers (which keep their normal top-up-
+   * queue + explorer fallback recipient logic). Ignored when `to` is
+   * set (fixed recipient always wins).
+   */
+  farmMain?: boolean;
 }
 
 interface TransferResult {
@@ -142,6 +152,22 @@ export async function runTransfer(
     console.log(`Loaded ${wallets.length} wallet${wallets.length === 1 ? "" : "s"} (${summarizeWalletSources(wallets)}).\n`);
 
     const selected = await pickWallets(wallets, flags.wallet);
+
+    // Farm-main mode: when enabled, every non-main wallet sends its
+    // transfers to the main wallet address (regardless of explorer
+    // pool or top-up queue). We resolve the main address once here so
+    // the per-wallet recipient builder below can short-circuit it.
+    const mainWalletAll = wallets.find((w) => w.role === "main");
+    const farmMainEnabled = !!flags.farmMain && !flags.to;
+    const farmMainAddress = farmMainEnabled && mainWalletAll
+      ? mainWalletAll.address.toLowerCase()
+      : undefined;
+    if (flags.farmMain && !mainWalletAll) {
+      console.log(`  ⚠ farm-main requested but no main wallet found in env / wallets.txt — ignoring farm-main flag.`);
+    }
+    if (farmMainAddress) {
+      console.log(`  farm-main: non-main wallets will send to main address ${shortAddress(mainWalletAll!.address)} (workers earn 0 TePoints; main earns "Receive" credit).`);
+    }
     let count = flags.count
       ? parsePositiveInt(flags.count, "count")
       : await askCount("How many transactions per wallet?", 1);
@@ -170,7 +196,13 @@ export async function runTransfer(
       // Recipient sourcing differs per chain: TeQoin uses the explorer
       // pool (with the main-wallet top-up queue layered on top); Sepolia
       // has no equivalent indexer so it uses ONLY the top-up queue.
-      if (useExplorer) {
+      //
+      // Optimization: in farm-main mode, workers ALL send to the main
+      // address — they never touch the explorer pool. If the only
+      // selected wallets are workers, skip the explorer fetch entirely.
+      const mainInSelection = selected.some((w) => w.role === "main");
+      const needExplorerForMain = useExplorer && (!farmMainAddress || mainInSelection);
+      if (needExplorerForMain) {
         console.log(`Fetching recipient pool from ${chain.name} explorer…`);
         const exclude = wallets.map((w) => w.address);
         recipientPool = await fetchAddressPool(exclude, { env });
@@ -178,6 +210,8 @@ export async function runTransfer(
         if (recipientPool.length === 0) {
           throw new Error("Recipient pool is empty. Pass --to <addr> to use a fixed recipient instead.");
         }
+      } else if (useExplorer && farmMainAddress && !mainInSelection) {
+        console.log(`  (skipping explorer fetch — farm-main routes all workers to main address)`);
       }
 
       // Top-up priority queue for the main wallet. Only build it if the
@@ -290,11 +324,13 @@ export async function runTransfer(
       : `${fixedAmount} ${chain.symbol}`;
     const recipientsLabel = fixedRecipient
       ? "fixed (--to)"
-      : useExplorer
-        ? topupQueue.length > 0
-          ? `auto from explorer (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} first)`
-          : "auto from explorer"
-        : `top-up queue: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold (poorest first; no explorer fallback on ${chain.name})`;
+      : farmMainAddress
+        ? `farm-main: workers → main (${shortAddress(mainWalletAll!.address)}); main → top-up queue + explorer fallback`
+        : useExplorer
+          ? topupQueue.length > 0
+            ? `auto from explorer (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} first)`
+            : "auto from explorer"
+          : `top-up queue: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold (poorest first; no explorer fallback on ${chain.name})`;
     console.log(`\nTransfer summary:`);
     console.log(`  Chain        : ${chain.name} (chainId ${chain.chainId})`);
     console.log(`  Wallets      : ${selected.length}`);
@@ -343,6 +379,7 @@ export async function runTransfer(
         recipientPool,
         topupQueue,
         topupCursor,
+        farmMainAddress,
       });
       if (plan.skipReason) {
         for (let k = 0; k < count; k++) {
@@ -468,6 +505,11 @@ function pickRetryRecipient(pool: readonly string[], tried: ReadonlySet<string>)
  * `topupCursor` is mutated in place so consecutive main-wallet calls
  * (e.g. main appearing once when `--wallet all` is used) progress
  * through the queue without giving the same generated wallet two slots.
+ *
+ * `farmMainAddress`: when set, non-main wallets send ALL their tx to
+ * this address instead of sampling from the explorer pool. The main
+ * wallet keeps its normal recipient logic (top-up queue then explorer
+ * fallback) — farm-main only changes worker behavior.
  */
 function buildRecipientsForWallet(args: {
   wallet: LoadedWallet;
@@ -476,10 +518,14 @@ function buildRecipientsForWallet(args: {
   recipientPool: readonly string[];
   topupQueue: readonly string[];
   topupCursor: { i: number };
+  farmMainAddress: string | undefined;
 }): string[] {
-  const { wallet, count, fixedRecipient, recipientPool, topupQueue, topupCursor } = args;
+  const { wallet, count, fixedRecipient, recipientPool, topupQueue, topupCursor, farmMainAddress } = args;
   if (fixedRecipient) {
     return Array(count).fill(fixedRecipient.toLowerCase());
+  }
+  if (farmMainAddress && wallet.role !== "main") {
+    return Array(count).fill(farmMainAddress);
   }
   const out: string[] = [];
   if (wallet.role === "main") {
