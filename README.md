@@ -118,6 +118,57 @@ Ctrl+C at any point exits cleanly. Wallets that can't cover the per-cycle batch 
 
 Amount range and cooldown are configurable via env (`AUTO_TRANSFER_AMOUNT_MIN`/`MAX`, `AUTO_BRIDGE_AMOUNT_MIN`/`MAX`, `AUTO_COOLDOWN_HOURS`) — useful for smoke-testing the loop without waiting a full day, or for tweaking the spending profile without changing code.
 
+#### Auto-adjust per-tx amounts to fit balance
+
+When the bot uses a random per-tx amount range — every tx in the auto loop, plus any `transfer` / `bridge` invocation that uses `--random-min` / `--random-max` — it computes a **per-wallet** effective range that fits the wallet's current balance instead of unconditionally using the requested defaults:
+
+```
+per_tx_max = (balance − count × gas_reserve) / count
+per_tx_min = min(default_min, per_tx_max / 2)
+```
+
+- Wallets that can comfortably afford `count × default_max` keep the default range — behavior unchanged for funded wallets.
+- Underfunded wallets get a **scaled-down range** so all `count` tx still fit. Example: a worker with `0.00131 ETH` balance running 50 tx with default `0.0001..0.0013 ETH` gets scaled to roughly `0.000013..0.000026 ETH`/tx; all 50 tx broadcast successfully instead of being skipped.
+- Wallets whose per-tx budget falls below `1e-8 ETH` are skipped (no infinite-tiny tx).
+- Fixed-amount mode (`--amount` without `--random-min/--random-max`) still uses the legacy "skip if balance < count × amount" pre-flight.
+
+Per-tx **gas reserves** (decimal ETH, override via env):
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `TEQOIN_TRANSFER_GAS_RESERVE`   | `0.000001` | TeQoin L2 transfer (basefee × 21k gas + safety) |
+| `SEPOLIA_TRANSFER_GAS_RESERVE`  | `0.0001`   | Sepolia transfer (~5 gwei × 21k gas + safety) |
+| `TEQOIN_BRIDGE_GAS_RESERVE`     | `0.000002` | TeQoin L2 withdraw (contract call, slightly higher gas) |
+| `SEPOLIA_BRIDGE_GAS_RESERVE`    | `0.0002`   | Sepolia deposit (contract call on L1) |
+
+Each phase logs the active reserve in its summary block, and per-wallet rows show `↳ scaled range …` whenever a wallet was scaled down. This means **you do not need to manually top up workers** before the auto loop — workers will keep operating off whatever native ETH they have, with amounts shrinking as their balance drops.
+
+#### Phase 0: pre-cycle worker top-up
+
+In addition to per-wallet auto-scaling, every auto cycle starts with a **Phase 0** that proactively replenishes underfunded workers from the main wallet on both chains. This makes the bot fully self-sustaining for as long as the main wallet has balance:
+
+1. **Phase 0** (NEW): main wallet → workers (direct transfer) on TeQoin **and** Sepolia. Each worker below `MAIN_TOPUP_THRESHOLD` is brought up to `AUTO_PRECYCLE_TOPUP_TARGET`.
+2. Phase 1: transfers (TeQoin L2). Workers + main do their cycle activity.
+3. Phase 2: bridges (deposit, withdraw, or both). Main account also tops up workers via deposit recipient queue (TeQoin L2).
+4. Cooldown 24h.
+
+Why direct transfer, not bridge withdraw, for Sepolia? Withdraw bridges have a **24h challenge period** before the funds become spendable on Sepolia — useless for "I need Sepolia gas now to do another deposit bridge".
+
+Phase 0 is skipped (with a clear log message) when:
+- `AUTO_PRECYCLE_TOPUP=off` is set in env
+- The main wallet is **not** in the active `--wallet` selection (e.g. `--wallet 2`)
+- There are no generated worker wallets yet
+- All workers are already above threshold
+
+If main runs out of balance for a particular top-up, that worker is skipped this cycle and re-checked on the next.
+
+| Variable | Default | Notes |
+| -------- | ------- | ----- |
+| `AUTO_PRECYCLE_TOPUP`         | `on`     | Set to `off` to disable Phase 0 entirely. |
+| `AUTO_PRECYCLE_TOPUP_TARGET`  | `2 × MAIN_TOPUP_THRESHOLD` (= `0.01` ETH for the default threshold) | Target balance to bring each underfunded worker up to. |
+
+TeQoin top-ups from Phase 0 **are** counted toward TePoints (Send for main, Recv for worker). Sepolia top-ups are NOT counted because Sepolia activity earns no TePoints in the TeQoin Mini App.
+
 #### Cooldown dashboard & TePoints (with row limit)
 
 At the start of every cooldown the bot prints a per-wallet table:
@@ -323,6 +374,12 @@ Non-interactive mode (CI / cron / piped) automatically uses flags + env vars and
 | `AUTO_COOLDOWN_HOURS`              | no | Sleep duration between auto cycles (default `24`). Fractional values OK for testing. |
 | `AUTO_DASHBOARD_LIMIT`             | no | Max wallets shown inline in the auto cooldown dashboard (default `10`). Set to `all` or `0` to print every row inline. The full table is always written to `./auto-dashboard.txt` regardless. |
 | `MAIN_TOPUP_THRESHOLD`             | no | Threshold (in ETH) below which a generated wallet is prioritized as a recipient when the main account runs `transfer`, `bridge`, or `auto` without an explicit `--to`. For `bridge`, the threshold is checked against the *destination* chain's balance. Default `0.005`. Set to `0` to disable. |
+| `TEQOIN_TRANSFER_GAS_RESERVE`      | no | Per-tx fee headroom (decimal ETH) reserved on TeQoin L2 when auto-scaling random transfer amounts to fit balance (default `0.000001`). |
+| `SEPOLIA_TRANSFER_GAS_RESERVE`     | no | Per-tx fee headroom on Sepolia when auto-scaling random transfer amounts (default `0.0001`). |
+| `TEQOIN_BRIDGE_GAS_RESERVE`        | no | Per-tx fee headroom on TeQoin L2 when auto-scaling random *withdraw* amounts (default `0.000002`). |
+| `SEPOLIA_BRIDGE_GAS_RESERVE`       | no | Per-tx fee headroom on Sepolia when auto-scaling random *deposit* amounts (default `0.0002`). |
+| `AUTO_PRECYCLE_TOPUP`              | no | `on` (default) or `off` — toggle the auto cycle's Phase 0 pre-cycle worker top-up. |
+| `AUTO_PRECYCLE_TOPUP_TARGET`       | no | Target balance (decimal ETH) for Phase 0 top-ups. Defaults to `2 × MAIN_TOPUP_THRESHOLD`. |
 
 \*Or use `wallets.txt`.
 
@@ -374,6 +431,7 @@ src/
 - [x] **Auto 24h** loop with randomized per-tx amounts
 - [x] **Create worker wallets** + main-account top-up priority
 - [x] **Compact balance dashboard** + auto-cooldown dashboard with TeQoin Mini App `TePoints` (persisted to `auto-stats.json`)
+- [x] **Auto-adjust random per-tx amounts** to fit each wallet's current balance (so underfunded workers keep transacting at smaller sizes instead of being skipped)
 - [ ] Bridge status polling (read `bridge-history` and watch for L1 finalization / claim window)
 - [ ] ERC-20 transfer + ERC-20 bridge (the bridge contract supports it; this only ships native ETH today)
 - [ ] Per-address tx history fetch (`/api/v1/address/:addr/transactions`)

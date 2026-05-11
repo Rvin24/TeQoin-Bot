@@ -50,11 +50,30 @@ import { getChainBySlug, txUrl, type ChainProfile } from "./chains.js";
 import { buildProvider, assertChainMatches } from "./rpc.js";
 import { loadWallets, shortAddress, summarizeWalletSources, type LoadedWallet } from "./wallet.js";
 import { askAmount, askCount, confirm, pickWallets } from "./prompt.js";
-import { pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
+import { computeScaledRange, pickRandomAmount, validateRange, type RandomEthRange } from "./random.js";
 import * as readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 const DEFAULT_TOPUP_THRESHOLD_ETH = "0.005";
+
+/**
+ * Default per-tx fee headroom we leave when auto-scaling random bridge
+ * amounts to fit a wallet's balance. Values are in decimal ETH and are
+ * applied to the *source* chain (where the tx is broadcast).
+ *
+ * The bridge contract calls cost more gas than a plain transfer
+ * (~50–80k gas vs 21k), so the reserves here are slightly higher than
+ * `DEFAULT_GAS_RESERVE_PER_TX_ETH` in transfer.ts:
+ *
+ *   tequoin : ~0.000002 ETH  (TeQoin L2 base fee × ~60k gas)
+ *   sepolia : ~0.0002 ETH   (~5 gwei × ~60k gas + headroom)
+ *
+ * Override via TEQOIN_BRIDGE_GAS_RESERVE / SEPOLIA_BRIDGE_GAS_RESERVE.
+ */
+const DEFAULT_BRIDGE_GAS_RESERVE_PER_TX_ETH: Record<string, string> = {
+  tequoin: "0.000002",
+  sepolia: "0.0002",
+};
 
 export interface BridgeFlags {
   /** "deposit" (Sepolia→TeQoin) or "withdraw" (TeQoin→Sepolia). */
@@ -217,12 +236,49 @@ export async function runBridge(
       console.log(`Top-up priority: ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} below threshold on ${route.destination.name}.\n`);
     }
 
+    // Per-wallet pre-flight. For random-range mode we auto-scale the
+    // per-tx amount to fit each wallet, mirroring the transfer command.
+    // For fixed-amount mode we still require the full count × amount.
+    const gasReservePerTxWei = resolveBridgeGasReservePerTx(route.source.slug, env);
+    interface WalletPlan {
+      effectiveRange: RandomEthRange | undefined;
+      skipReason?: string;
+      scaled: boolean;
+    }
+    const walletPlans: WalletPlan[] = selected.map((_w, i) => {
+      const balance = balances[i] ?? 0n;
+      if (randomRange) {
+        const r = computeScaledRange({
+          balanceWei: balance,
+          count,
+          defaultRange: randomRange,
+          gasReservePerTxWei,
+        });
+        if (!r.range) {
+          return {
+            effectiveRange: undefined,
+            skipReason: r.reason ?? "insufficient balance",
+            scaled: false,
+          };
+        }
+        return { effectiveRange: r.range, scaled: r.scaled };
+      }
+      const fixedWei = fixedValue ?? 0n;
+      const requiredWei = fixedWei * BigInt(count) + gasReservePerTxWei * BigInt(count);
+      const skip = balance < requiredWei;
+      return {
+        effectiveRange: undefined,
+        skipReason: skip
+          ? `balance ${formatEther(balance)} ETH < required ${formatEther(requiredWei)} ETH for ${count} tx at ${fixedAmount ?? "?"} ETH`
+          : undefined,
+        scaled: false,
+      };
+    });
+
     const amountLabel = randomRange
-      ? `random ${randomRange.min}–${randomRange.max} ${route.source.symbol} per tx`
+      ? `random ${randomRange.min}–${randomRange.max} ${route.source.symbol} per tx (auto-scaled per wallet to fit balance)`
       : `${fixedAmount} ${route.source.symbol}`;
     const totalBridges = count * selected.length;
-    const perTxBudget = randomRange ? parseEther(randomRange.max) : (fixedValue ?? 0n);
-    const required = perTxBudget * BigInt(count);
     console.log(`\nBridge summary:`);
     console.log(`  Direction    : ${route.direction.toUpperCase()} (${route.source.name} → ${route.destination.name})`);
     console.log(`  Wallets      : ${selected.length}`);
@@ -235,12 +291,19 @@ export async function runBridge(
         ? `auto (main wallet tops up ${topupQueue.length} generated wallet${topupQueue.length === 1 ? "" : "s"} on ${route.destination.name} first; falls back to sender's own address)`
         : "<same as sender on destination>";
     console.log(`  Recipient    : ${recipientLabel}`);
+    if (randomRange) {
+      console.log(`  Gas reserve  : ${formatEther(gasReservePerTxWei)} ${route.source.symbol}/tx (override via ${bridgeGasReserveEnvVar(route.source.slug)})`);
+    }
     selected.forEach((w, i) => {
       const bal = balances[i] ?? 0n;
-      const ok = bal >= required;
+      const plan = walletPlans[i]!;
+      const note = plan.skipReason
+        ? `  ⚠ will skip — ${plan.skipReason}`
+        : plan.scaled && plan.effectiveRange
+          ? `  ↳ scaled range ${plan.effectiveRange.min}–${plan.effectiveRange.max} ${route.source.symbol}/tx`
+          : "";
       console.log(
-        `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${route.source.symbol}` +
-        (ok ? "" : `  ⚠ need up to ${formatEther(required)} for batch — will skip`),
+        `  Balance      : #${w.index} ${shortAddress(w.address)} = ${formatEther(bal)} ${route.source.symbol}${note}`,
       );
     });
     if (route.direction === "withdraw") {
@@ -265,9 +328,9 @@ export async function runBridge(
 
     for (let i = 0; i < selected.length; i++) {
       const wallet = selected[i]!;
-      const balance = balances[i] ?? 0n;
-      if (balance < required) {
-        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped (insufficient balance for batch).`);
+      const plan = walletPlans[i]!;
+      if (plan.skipReason) {
+        console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — skipped: ${plan.skipReason}.`);
         skippedCount += count;
         continue;
       }
@@ -279,10 +342,16 @@ export async function runBridge(
         topupCursor,
       });
       const contract = new Contract(route.contractAddress, route.abi, wallet.signer);
-      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${count} tx…`);
+      const walletRange = plan.effectiveRange;
+      const scaledNote = plan.scaled && walletRange
+        ? `  (scaled range ${walletRange.min}–${walletRange.max} ${route.source.symbol})`
+        : "";
+      console.log(`\n#${wallet.index} ${shortAddress(wallet.address)} — bridging ${count} tx…${scaledNote}`);
       for (let k = 0; k < count; k++) {
         const recipient = recipientsForWallet[k]!;
-        const txAmount = randomRange ? pickRandomAmount(randomRange) : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
+        const txAmount = walletRange
+          ? pickRandomAmount(walletRange)
+          : { eth: fixedAmount ?? "", wei: fixedValue ?? 0n };
         try {
           const tx = await invokeBridge(contract, route, recipient, txAmount.wei);
           console.log(`  [${k + 1}/${count}] → ${shortAddress(recipient)}  ${txAmount.eth} ${route.source.symbol}  hash: ${tx.hash}`);
@@ -476,4 +545,34 @@ function resolveRandomRange(flags: BridgeFlags): RandomEthRange | undefined {
     throw new Error("--random-min and --random-max must be provided together.");
   }
   return validateRange({ min, max });
+}
+
+/**
+ * Env var name for the per-tx bridge gas reserve override on a given
+ * source chain. Hard-coded (rather than derived from
+ * `slug.toUpperCase()`) to keep the brand spelling "TEQOIN" consistent
+ * across env vars even though the chain slug carries an extra "u" for
+ * historical reasons.
+ */
+const BRIDGE_GAS_RESERVE_ENV_VAR: Record<string, string> = {
+  tequoin: "TEQOIN_BRIDGE_GAS_RESERVE",
+  sepolia: "SEPOLIA_BRIDGE_GAS_RESERVE",
+};
+
+function bridgeGasReserveEnvVar(chainSlug: string): string {
+  return BRIDGE_GAS_RESERVE_ENV_VAR[chainSlug] ?? `${chainSlug.toUpperCase()}_BRIDGE_GAS_RESERVE`;
+}
+
+/**
+ * Resolve the per-tx bridge gas reserve (in wei) used by the
+ * random-range scaler. Reads `${SLUG}_BRIDGE_GAS_RESERVE` from env
+ * (decimal ETH string) and falls back to the chain-specific default.
+ */
+function resolveBridgeGasReservePerTx(chainSlug: string, env: NodeJS.ProcessEnv): bigint {
+  const fallback = DEFAULT_BRIDGE_GAS_RESERVE_PER_TX_ETH[chainSlug] ?? "0";
+  const raw = env[bridgeGasReserveEnvVar(chainSlug)]?.trim() || fallback;
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(raw) || Number(raw) < 0) {
+    throw new Error(`Invalid ${bridgeGasReserveEnvVar(chainSlug)}="${raw}". Must be a non-negative decimal (e.g. 0.0001).`);
+  }
+  return parseEther(raw);
 }

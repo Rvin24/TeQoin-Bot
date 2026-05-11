@@ -28,11 +28,11 @@
 
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { formatEther } from "ethers";
+import { formatEther, parseEther } from "ethers";
 import { askCount, askBridgeMode, pickWallets, confirm } from "./prompt.js";
 import { runTransfer, type TransferRunStats } from "./transfer.js";
 import { runBridge, type BridgeRunStats } from "./bridge.js";
-import { loadWallets, type LoadedWallet } from "./wallet.js";
+import { loadWallets, shortAddress, type LoadedWallet } from "./wallet.js";
 import { buildProvider } from "./rpc.js";
 import { getChainBySlug, type ChainProfile } from "./chains.js";
 import { validateRange, type RandomEthRange } from "./random.js";
@@ -193,16 +193,42 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
     bridges: [],
   };
 
+  // Phase 0: pre-cycle top-up. Main wallet ensures every generated
+  // worker has at least AUTO_PRECYCLE_TOPUP_TARGET on each chain so the
+  // following phases never run out of gas mid-cycle. Direct transfers
+  // on both chains — withdraw bridges have a 24h challenge period and
+  // can't be used for "now I need Sepolia ETH" funding. Disabled when
+  // AUTO_PRECYCLE_TOPUP=off, or when the main wallet isn't part of the
+  // active selection.
+  try {
+    const topupStats = await runPreCycleTopUp(config, env);
+    for (const [addr, n] of Object.entries(topupStats.sendsByAddress)) {
+      cycle.transfer.sendsByAddress[addr] = (cycle.transfer.sendsByAddress[addr] ?? 0) + n;
+    }
+    for (const [addr, n] of Object.entries(topupStats.receivesByAddress)) {
+      cycle.transfer.receivesByAddress[addr] = (cycle.transfer.receivesByAddress[addr] ?? 0) + n;
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.log(`Pre-cycle top-up failed: ${message}. Continuing to phase 1.`);
+  }
+
   // Phase 1: transfers (TeQoin L2)
   console.log(`\n--- Phase 1/2: ${config.transfersPerWallet} transfer(s) per wallet ---`);
   try {
-    cycle.transfer = await runTransfer({
+    const phase1 = await runTransfer({
       wallet: config.walletSelector,
       count: String(config.transfersPerWallet),
       randomMin: config.transferRange.min,
       randomMax: config.transferRange.max,
       yes: true,
     }, env);
+    for (const [addr, n] of Object.entries(phase1.sendsByAddress)) {
+      cycle.transfer.sendsByAddress[addr] = (cycle.transfer.sendsByAddress[addr] ?? 0) + n;
+    }
+    for (const [addr, n] of Object.entries(phase1.receivesByAddress)) {
+      cycle.transfer.receivesByAddress[addr] = (cycle.transfer.receivesByAddress[addr] ?? 0) + n;
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.log(`Transfer phase failed: ${message}. Continuing to bridge phase.`);
@@ -231,6 +257,140 @@ async function runCycle(config: AutoConfig, env: NodeJS.ProcessEnv): Promise<Cyc
     }
   }
   return cycle;
+}
+
+/**
+ * Pre-cycle top-up: when the main wallet is in the active selection,
+ * scan every generated worker on both TeQoin L2 and Sepolia, and
+ * direct-transfer enough native ETH from main → worker to bring any
+ * worker that is below `MAIN_TOPUP_THRESHOLD` up to
+ * `AUTO_PRECYCLE_TOPUP_TARGET`. This guarantees workers always have
+ * gas before phase 1/2 start.
+ *
+ * Uses direct sends rather than bridges because bridge withdraws have
+ * a 24-hour challenge period before the funds become spendable on
+ * Sepolia — useless for "right now" funding.
+ *
+ * Behavior:
+ *   - Skipped when AUTO_PRECYCLE_TOPUP=off, or when the main wallet
+ *     isn't part of the cycle's wallet selection, or when there are
+ *     no generated workers.
+ *   - Per-tx is bounded by main wallet's actual balance — if main
+ *     can't afford any individual top-up, that worker is skipped for
+ *     this cycle and re-checked next cycle.
+ *   - TeQoin top-ups are credited to TePoints (Send for main, Recv
+ *     for worker). Sepolia top-ups are NOT credited because Sepolia
+ *     activity earns no TePoints in the TeQoin Mini App.
+ */
+async function runPreCycleTopUp(
+  config: AutoConfig,
+  env: NodeJS.ProcessEnv,
+): Promise<TransferRunStats> {
+  const stats: TransferRunStats = { sendsByAddress: {}, receivesByAddress: {} };
+  const enabled = (env.AUTO_PRECYCLE_TOPUP ?? "on").trim().toLowerCase() !== "off";
+  if (!enabled) {
+    console.log("\n--- Phase 0: pre-cycle top-up DISABLED (AUTO_PRECYCLE_TOPUP=off) ---");
+    return stats;
+  }
+
+  const tequoin = mustChain("tequoin");
+  const sepolia = mustChain("sepolia");
+  const teqoinProvider = buildProvider(tequoin, env);
+  const sepoliaProvider = buildProvider(sepolia, env);
+  try {
+    const allWallets = loadWallets(teqoinProvider, { env });
+    const main = allWallets.find((w) => w.role === "main");
+    if (!main) {
+      console.log("\n--- Phase 0: pre-cycle top-up SKIPPED (no main wallet) ---");
+      return stats;
+    }
+    if (config.walletSelector !== "all" && config.walletSelector !== String(main.index)) {
+      console.log(`\n--- Phase 0: pre-cycle top-up SKIPPED (main wallet #${main.index} not in --wallet ${config.walletSelector}) ---`);
+      return stats;
+    }
+    const generated = allWallets.filter((w) => w.role === "generated");
+    if (generated.length === 0) {
+      console.log("\n--- Phase 0: pre-cycle top-up SKIPPED (no generated workers) ---");
+      return stats;
+    }
+
+    // Resolve threshold + target. Threshold = the same MAIN_TOPUP_THRESHOLD
+    // used elsewhere; target defaults to 2× threshold (so workers get
+    // some headroom and don't immediately re-flag below threshold).
+    const thresholdStr = (env.MAIN_TOPUP_THRESHOLD ?? "0.005").trim();
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(thresholdStr)) {
+      throw new Error(`Invalid MAIN_TOPUP_THRESHOLD="${thresholdStr}". Use decimal ETH (e.g. 0.005).`);
+    }
+    const thresholdWei = parseEther(thresholdStr);
+    const defaultTargetWei = thresholdWei * 2n;
+    const targetStr = env.AUTO_PRECYCLE_TOPUP_TARGET?.trim() || formatEther(defaultTargetWei);
+    if (!/^[0-9]+(\.[0-9]+)?$/.test(targetStr)) {
+      throw new Error(`Invalid AUTO_PRECYCLE_TOPUP_TARGET="${targetStr}". Use decimal ETH (e.g. 0.01).`);
+    }
+    const targetWei = parseEther(targetStr);
+    if (targetWei <= 0n) {
+      throw new Error(`AUTO_PRECYCLE_TOPUP_TARGET must be > 0 (got ${targetStr}).`);
+    }
+
+    console.log(`\n--- Phase 0: pre-cycle top-up (target ${targetStr} ETH on each chain, threshold ${thresholdStr} ETH) ---`);
+
+    for (const chain of [tequoin, sepolia]) {
+      const provider = chain.slug === "tequoin" ? teqoinProvider : sepoliaProvider;
+      const mainSigner = main.signer.connect(provider);
+      const balances = await Promise.all(generated.map((w) => provider.getBalance(w.address)));
+      const lowWorkers = generated
+        .map((w, i) => ({ wallet: w, balance: balances[i] ?? 0n }))
+        .filter((x) => x.balance < thresholdWei)
+        .sort((a, b) => (a.balance < b.balance ? -1 : a.balance > b.balance ? 1 : 0));
+      if (lowWorkers.length === 0) {
+        console.log(`  ${chain.name}: all ${generated.length} worker${generated.length === 1 ? "" : "s"} above threshold; nothing to do.`);
+        continue;
+      }
+      const totalNeeded = lowWorkers.reduce((acc, x) => acc + (targetWei - x.balance), 0n);
+      const mainBalance = await provider.getBalance(main.address);
+      console.log(
+        `  ${chain.name}: ${lowWorkers.length}/${generated.length} workers below ${thresholdStr} ${chain.symbol}; ` +
+        `needs ≈ ${formatEther(totalNeeded)} ${chain.symbol} total; ` +
+        `main balance = ${formatEther(mainBalance)} ${chain.symbol}.`,
+      );
+
+      let sent = 0;
+      let skipped = 0;
+      let failed = 0;
+      for (const { wallet: worker, balance } of lowWorkers) {
+        const need = targetWei - balance;
+        if (need <= 0n) continue;
+        try {
+          const mainBalNow = await provider.getBalance(main.address);
+          if (mainBalNow < need) {
+            console.log(`    [skip] main has ${formatEther(mainBalNow)} ${chain.symbol}, needs ${formatEther(need)} for ${shortAddress(worker.address)}.`);
+            skipped++;
+            continue;
+          }
+          const tx = await mainSigner.sendTransaction({ to: worker.address, value: need });
+          console.log(`    [send] ${formatEther(need)} ${chain.symbol} → ${shortAddress(worker.address)}  hash: ${tx.hash}`);
+          await tx.wait(1);
+          sent++;
+          // Only TeQoin transfers earn TePoints in the mini-app.
+          if (chain.slug === "tequoin") {
+            const senderKey = main.address.toLowerCase();
+            const recipientKey = worker.address.toLowerCase();
+            stats.sendsByAddress[senderKey] = (stats.sendsByAddress[senderKey] ?? 0) + 1;
+            stats.receivesByAddress[recipientKey] = (stats.receivesByAddress[recipientKey] ?? 0) + 1;
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.log(`    [fail] → ${shortAddress(worker.address)}: ${message}`);
+          failed++;
+        }
+      }
+      console.log(`  ${chain.name}: ${sent} sent, ${skipped} skipped, ${failed} failed.`);
+    }
+  } finally {
+    teqoinProvider.destroy();
+    sepoliaProvider.destroy();
+  }
+  return stats;
 }
 
 /**

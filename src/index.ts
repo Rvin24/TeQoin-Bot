@@ -87,6 +87,37 @@ Auto-24h env overrides:
                             The full table is always written to
                             ./auto-dashboard.txt regardless.
 
+Auto-adjust per-tx amounts (random-range mode only):
+  When --random-min / --random-max is in effect (always the case inside
+  auto-24h), the bot computes a per-wallet effective range that fits
+  the wallet's current balance:
+
+      per_tx_max = (balance − count × gas_reserve) / count
+      per_tx_min = min(default_min, per_tx_max / 2)
+
+  Wallets whose budget can comfortably afford count*default_max keep
+  the default range. Underfunded wallets get a scaled-down range so all
+  count tx still fit. Wallets whose per-tx budget falls below 1e-8 ETH
+  are skipped instead of broadcast.
+
+  Default per-tx gas reserves (override via env, decimal ETH):
+    TEQOIN_TRANSFER_GAS_RESERVE   default 0.000001
+    SEPOLIA_TRANSFER_GAS_RESERVE  default 0.0001
+    TEQOIN_BRIDGE_GAS_RESERVE     default 0.000002
+    SEPOLIA_BRIDGE_GAS_RESERVE    default 0.0002
+
+  Pre-cycle top-up (auto-24h only):
+    Before phase 1 of every cycle, if the main wallet is in the active
+    selection, the bot direct-transfers native ETH from main → each
+    generated worker that's below MAIN_TOPUP_THRESHOLD on TeQoin AND on
+    Sepolia, bringing each up to AUTO_PRECYCLE_TOPUP_TARGET.
+
+      AUTO_PRECYCLE_TOPUP         "on" (default) or "off"
+      AUTO_PRECYCLE_TOPUP_TARGET  default 2 * MAIN_TOPUP_THRESHOLD
+
+  Fixed-amount mode (--amount, no random range) skips auto-scaling and
+  uses the legacy "skip if balance < count * amount" pre-flight.
+
 Create Account flags:
   --count <N>           number of new wallets to generate (else interactive)
   --yes                 skip the confirmation prompt
